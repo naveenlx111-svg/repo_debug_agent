@@ -1,0 +1,10 @@
+groq
+sentence-transformers
+torch
+chromadb
+tree-sitter
+tree-sitter-python
+python-dotenv
+tqdm
+pytest
+black
