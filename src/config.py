@@ -5,7 +5,7 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).parent.parent
 INDEX_DIR = BASE_DIR/".agent_index"
-GROP_API_KEY = os.getenv("GROP_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TRIAGE_MODEL = "llama-3.1-8b-instant"
 FIX_MODEL = "llama-3.3-70b-versatile"
 
