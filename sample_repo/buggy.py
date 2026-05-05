@@ -14,6 +14,9 @@ def read_file(path):
     return f.read()
 
 def calculate_average(numbers):
-    # bug: no check for empty list
+    if not numbers:
+        raise ValueError("Cannot calculate average of an empty list")
+    if not all(isinstance(x, (int, float)) for x in numbers):
+        raise TypeError("All numbers must be integers or floats")
     total = sum(numbers)
     return total / len(numbers)
