@@ -1,5 +1,7 @@
 def divide(a, b):
-    # bug: no check for division by zero
+    # check for division by zero
+    if b == 0:
+        raise ZeroDivisionError("Cannot divide by zero")
     return a / b
 
 def get_first_item(lst):
