@@ -87,3 +87,18 @@ def test_diff_is_git_apply_compatible(tmp_path):
         pytest.skip("git not available")
     assert result.returncode == 0, result.stderr
     os.remove(patch_file)
+
+
+def test_refresh_undoes_writes_made_inside_the_sandbox(tmp_path):
+    repo = write_tree(tmp_path / "repo", {"a.py": "x = 1\n", "b.py": "y = 1\n"})
+    ws = Workspace(repo)
+    ws.write("b.py", "y = 2\n")
+    sandbox = ws.materialize()
+    try:
+        (sandbox / "a.py").write_text("vandalized")
+        (sandbox / "b.py").write_text("vandalized")
+        ws.refresh(["a.py"])
+        assert (sandbox / "a.py").read_text() == "x = 1\n"
+        assert (sandbox / "b.py").read_text() == "y = 2\n"  # edited files are always restored
+    finally:
+        ws.cleanup()

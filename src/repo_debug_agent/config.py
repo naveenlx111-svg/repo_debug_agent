@@ -24,6 +24,9 @@ class ProviderPreset:
     triage_model: str | None
     fix_model: str | None
     extra_body: dict = field(default_factory=dict)
+    # Concurrent requests. Local servers usually process one at a time, and queued requests
+    # just wait out their client-side timeout.
+    workers: int = 1
 
 
 PROVIDERS: dict[str, ProviderPreset] = {
@@ -32,6 +35,7 @@ PROVIDERS: dict[str, ProviderPreset] = {
         api_key_env="GROQ_API_KEY",
         triage_model="llama-3.1-8b-instant",
         fix_model="llama-3.3-70b-versatile",
+        workers=4,
     ),
     # Any OpenAI-compatible local server: llama.cpp's llama-server, LM Studio, vLLM, ...
     # The model is auto-detected from /v1/models when not given. Thinking is disabled
@@ -148,9 +152,11 @@ class AgentSettings:
     min_confidence: float = 0.6
     review_max_lines: int = 400  # files longer than this are reviewed in windows
     max_file_bytes: int = 256_000
-    workers: int = 4
+    workers: int | None = None  # None: the provider's default
 
     # Fixing
+    repro: bool = True  # reproduce Python bugs with a model-written script before fixing
+    python: str | None = None  # interpreter for reproduction scripts (None: auto-detect)
     max_attempts: int = 3
     context_chars: int = 6_000  # budget for retrieved cross-file context in fix prompts
 
@@ -170,5 +176,7 @@ class AgentSettings:
             raise ConfigError("--min-confidence must be between 0 and 1")
         if self.max_attempts < 1:
             raise ConfigError("--max-attempts must be at least 1")
+        if self.workers is None:
+            self.workers = PROVIDERS[self.llm.provider].workers
         if self.workers < 1:
             raise ConfigError("--workers must be at least 1")

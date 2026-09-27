@@ -44,6 +44,17 @@ def build_parser() -> argparse.ArgumentParser:
         help='test command run in a sandbox copy to verify each fix, e.g. "pytest -q"',
     )
     g.add_argument("--test-timeout", type=float, default=600.0, help="seconds (default 600)")
+    g.add_argument(
+        "--no-repro",
+        action="store_true",
+        help="don't reproduce Python bugs with a model-written script before fixing "
+        "(the script runs in the sandbox copy)",
+    )
+    g.add_argument(
+        "--python",
+        metavar="PATH",
+        help="interpreter for reproduction scripts (default: the repo's .venv, else python3)",
+    )
 
     g = p.add_argument_group("output")
     g.add_argument("--apply", action="store_true", help="write accepted fixes into the repo")
@@ -70,7 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip issues the reviewer is less sure about (0-1, default 0.6)",
     )
     g.add_argument("--max-attempts", type=int, default=3, help="fix attempts per issue (default 3)")
-    g.add_argument("--workers", type=int, default=4, help="parallel file reviews (default 4)")
+    g.add_argument(
+        "--workers",
+        type=int,
+        help="parallel file reviews (default: 4 for groq, 1 for local servers)",
+    )
 
     g = p.add_argument_group("retrieval")
     g.add_argument(
@@ -114,6 +129,8 @@ def settings_from_args(args: argparse.Namespace) -> AgentSettings:
         max_issues=args.max_issues,
         min_confidence=args.min_confidence,
         max_attempts=args.max_attempts,
+        repro=not args.no_repro,
+        python=args.python,
         workers=args.workers,
         use_embeddings=not args.no_embeddings,
         embed_model=args.embed_model,

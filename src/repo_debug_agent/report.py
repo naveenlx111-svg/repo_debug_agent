@@ -19,6 +19,7 @@ STATUS_ICON = {
 }
 VERIFIED_LABEL = {
     "tests": "test suite (improved)",
+    "repro": "reproduction script (failed before the fix, passes after)",
     "no-regressions": "test suite (no regressions; no test covered the bug)",
     "syntax": "syntax + static checks only",
     "none": "not verified (no checker for this language)",
@@ -117,8 +118,21 @@ def render_markdown(report: RunReport) -> str:
                 "",
                 f"**Verified by:** {VERIFIED_LABEL.get(result.verified_by, result.verified_by)}",
             ]
+        if result.repro_status:
+            lines += ["", f"**Reproduction:** {result.repro_status.replace('_', ' ')}"]
         if result.diff:
             lines += ["", "```diff", result.diff.rstrip("\n"), "```"]
+        if result.repro_script:
+            lines += [
+                "",
+                "<details><summary>Reproduction script</summary>",
+                "",
+                "```python",
+                result.repro_script.rstrip("\n"),
+                "```",
+                "",
+                "</details>",
+            ]
         if result.attempts:
             lines += ["", "<details><summary>Attempts</summary>", ""]
             for attempt in result.attempts:

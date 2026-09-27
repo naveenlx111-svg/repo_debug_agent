@@ -29,6 +29,7 @@ from repo_debug_agent.llm import (
     strip_reasoning,
 )
 from repo_debug_agent.models import Attempt, Chunk, FixResult, FixStatus, Issue
+from repo_debug_agent.repro import Reproducer, ReproStatus, classify
 from repo_debug_agent.retrieval import ContextRetriever
 from repo_debug_agent.retrieval.symbols import SymbolIndex
 from repo_debug_agent.validation import TestRun, TestVerdict, check_edit, judge, run_tests
@@ -213,6 +214,7 @@ class Fixer:
         tests: TestHarness | None,
         max_attempts: int = 3,
         base_temperature: float = 0.1,
+        reproducer: Reproducer | None = None,
     ):
         self.llm = llm
         self.model = model
@@ -222,6 +224,7 @@ class Fixer:
         self.tests = tests
         self.max_attempts = max_attempts
         self.base_temperature = base_temperature
+        self.reproducer = reproducer
 
     def fix(self, issue: Issue, sf: SourceFile) -> FixResult:
         before = self.workspace.read(issue.file)
@@ -248,11 +251,39 @@ class Fixer:
             exclude_files={issue.file} if whole_file else set(),
         )
         test_output = self.tests.output_for(issue.file) if self.tests else None
+
+        repro = None
+        if self.reproducer is not None and sf.language.name == "python":
+            repro = self.reproducer.reproduce(issue, chunk, excerpt)
+            if repro.status == ReproStatus.NOT_REPRODUCED:
+                return FixResult(
+                    issue,
+                    FixStatus.DISMISSED,
+                    f"not reproducible: {repro.detail}",
+                    repro_status=repro.status.value,
+                    repro_script=repro.script,
+                )
+        reproduced = repro is not None and repro.status == ReproStatus.REPRODUCED
+        repro_context = (repro.script, repro.output) if reproduced else None
+
+        def result(status: FixStatus, explanation: str, **extra) -> FixResult:
+            return FixResult(
+                issue,
+                status,
+                explanation,
+                attempts=attempts,
+                repro_status=repro.status.value if repro else "",
+                repro_script=repro.script if repro else "",
+                **extra,
+            )
+
         base: list[Message] = [
             {"role": "system", "content": prompts.FIX_SYSTEM.format(language=sf.language.name)},
             {
                 "role": "user",
-                "content": prompts.fix_prompt(issue, chunk, excerpt, related, test_output),
+                "content": prompts.fix_prompt(
+                    issue, chunk, excerpt, related, test_output, repro_context
+                ),
             },
         ]
         messages = list(base)
@@ -274,7 +305,7 @@ class Fixer:
             parsed = parse_fix_reply(reply)
             if parsed.dismissed:
                 attempts.append(Attempt(n, "dismissed", parsed.explanation))
-                return FixResult(issue, FixStatus.DISMISSED, parsed.explanation, attempts=attempts)
+                return result(FixStatus.DISMISSED, parsed.explanation)
             if parsed.error:
                 attempts.append(Attempt(n, "invalid_reply", parsed.error))
                 messages = _with_feedback(
@@ -299,6 +330,17 @@ class Fixer:
             self.workspace.write(issue.file, after)
             verified_by = "syntax" if check.ok else "none"
             detail = "passed syntax/static checks" if check.ok else check.message
+            if reproduced:
+                run = self.reproducer.run(repro.script, issue.file)
+                if classify(run, issue.file) != "pass":
+                    self.workspace.write(issue.file, before)
+                    attempts.append(Attempt(n, "rejected_repro", run.excerpt(300)))
+                    messages = _with_feedback(
+                        base, reply, prompts.feedback_repro(run.excerpt(1500))
+                    )
+                    continue
+                verified_by = "repro"
+                detail = "reproduction script now passes"
             if self.tests is not None:
                 verdict, run = self.tests.evaluate()
                 if not verdict.acceptable:
@@ -307,24 +349,18 @@ class Fixer:
                     feedback = prompts.feedback_tests(verdict.reason, run.excerpt())
                     messages = _with_feedback(base, reply, feedback)
                     continue
-                verified_by = "tests" if verdict.improved else "no-regressions"
-                detail = verdict.reason
+                if verdict.improved or verified_by != "repro":
+                    verified_by = "tests" if verdict.improved else "no-regressions"
+                detail = f"{detail}; {verdict.reason}" if verified_by == "repro" else verdict.reason
 
             attempts.append(Attempt(n, "applied", detail))
             self.symbols.replace_file(issue.file, chunk_source(issue.file, after, sf.language))
-            return FixResult(
-                issue,
+            return result(
                 FixStatus.FIXED,
                 parsed.explanation or "(no explanation given)",
                 diff="".join(unified_diff(before, after, issue.file)),
                 verified_by=verified_by,
-                attempts=attempts,
             )
 
         last = attempts[-1].detail if attempts else "no attempts made"
-        return FixResult(
-            issue,
-            FixStatus.FAILED,
-            f"gave up after {len(attempts)} attempts; last: {last}",
-            attempts=attempts,
-        )
+        return result(FixStatus.FAILED, f"gave up after {len(attempts)} attempts; last: {last}")

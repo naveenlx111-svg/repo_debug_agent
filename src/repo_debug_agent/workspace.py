@@ -119,6 +119,15 @@ class Workspace:
         self.sandbox = sandbox
         return sandbox
 
+    def refresh(self, rels: list[str]) -> None:
+        """Rewrite sandbox copies from the agent's view of the files (undoing anything
+        a script run in the sandbox may have written to them)."""
+        if self.sandbox is None:
+            return
+        for rel in set(rels) | set(self._overlay):
+            text = self.read(rel)
+            _write(self.sandbox / rel, text, self._newlines.get(rel, "\n"))
+
     def cleanup(self) -> None:
         if self._tmp:
             shutil.rmtree(self._tmp, ignore_errors=True)

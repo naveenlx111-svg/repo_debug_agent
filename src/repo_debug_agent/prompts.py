@@ -94,6 +94,7 @@ def fix_prompt(
     file_excerpt: str,
     related: str,
     test_output: str | None,
+    repro: tuple[str, str] | None = None,
 ) -> str:
     fence = chunk.language
     target = describe_target(chunk)
@@ -117,6 +118,14 @@ def fix_prompt(
             "## Current test failures\n"
             "This output is from the project's real test suite. The expected values in its "
             f"assertions are correct by definition.\n```\n{test_output}\n```"
+        )
+    if repro:
+        script, output = repro
+        sections.append(
+            "## Reproduction (verified)\n"
+            "This script was run against the current code and fails, which confirms the bug. "
+            "Your fix must make it pass.\n"
+            f"```{fence}\n{script.rstrip()}\n```\nOutput:\n```\n{output}\n```"
         )
     import_note = (
         " If you need a new import, import inside the function." if fence == "python" else ""
@@ -157,4 +166,55 @@ def feedback_tests(reason: str, output: str) -> str:
     return (
         f"Your change was applied, but the test suite got worse ({reason}):\n```\n{output}\n```\n"
         "Revise the fix and reply again in the same format."
+    )
+
+
+def feedback_repro(output: str) -> str:
+    return (
+        "Your change was applied, but the reproduction script still fails:\n"
+        f"```\n{output}\n```\nRevise the fix and reply again in the same format."
+    )
+
+
+# --------------------------------------------------------------------------- reproduction
+
+REPRO_SYSTEM = (
+    "You are a meticulous Python engineer. You write minimal scripts that demonstrate bugs by "
+    "running the real code, and you never claim a bug you can't show."
+)
+
+
+def repro_prompt(issue: Issue, chunk: Chunk, file_excerpt: str, imports: str) -> str:
+    line = f" (line {issue.line})" if issue.line else ""
+    return (
+        f"An automated reviewer suspects a bug in `{chunk.file}`{line}. Automated reviewers are "
+        "often wrong.\n"
+        f"- Report: {issue.description}\n\n"
+        f"## The code in question: {describe_target(chunk)}\n```python\n{chunk.code}\n```\n\n"
+        f"## Rest of the file, for reference\n```python\n{file_excerpt}\n```\n\n"
+        "## Task\n"
+        "Write a short standalone Python script that demonstrates the bug by running the real code.\n"
+        f"- Import the code with: `{imports}` (it runs from the repository root, which is on sys.path).\n"
+        "- Call it with the input that triggers the bug, and `assert` what correct code must do.\n"
+        "- While the bug exists the script must fail (AssertionError or the reported exception); "
+        "once the bug is fixed it must pass.\n"
+        "- No test framework, no network, no files outside a temporary directory, under 30 lines.\n\n"
+        "If the problem can't be shown by running code (a leak, a race) or you conclude the code "
+        "is actually correct, reply with one line: NOT_REPRODUCIBLE: <reason>\n"
+        "Otherwise reply with only the script, in one ```python code block."
+    )
+
+
+def repro_feedback_passed() -> str:
+    return (
+        "Your script PASSED against the current code, so it does not demonstrate the bug. "
+        "If the bug is real, revise the script so it fails because of it. If running the code "
+        "shows it is actually correct, reply NOT_REPRODUCIBLE: <reason>."
+    )
+
+
+def repro_feedback_broken(output: str) -> str:
+    return (
+        "Your script failed for an unrelated reason, before reaching the code in question:\n"
+        f"```\n{output}\n```\nFix the script and reply with it again, in one ```python block."
     )

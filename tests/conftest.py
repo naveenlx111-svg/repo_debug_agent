@@ -33,8 +33,8 @@ def fix_reply(code: str, explanation: str = "Fixed it.", lang: str = "python") -
     return f"```{lang}\n{code}\n```\nEXPLANATION: {explanation}"
 
 
-def is_review(messages: list[Message]) -> bool:
-    return "Review this" in messages[-1]["content"] or "Review this" in messages[1]["content"]
+def is_repro_request(messages: list[Message]) -> bool:
+    return "demonstrates the bug" in messages[1]["content"]
 
 
 def write_tree(root: Path, files: dict[str, str]) -> Path:
@@ -60,6 +60,7 @@ def make_settings(tmp_path):
             llm=llm,
             out_dir=tmp_path / "reports",
             use_embeddings=False,
+            repro=False,  # tests that want reproduction turn it on explicitly
             workers=1,
             index_dir=tmp_path / "index",
         )

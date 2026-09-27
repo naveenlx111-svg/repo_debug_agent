@@ -109,6 +109,10 @@ class OpenAICompatibleLLM:
                     messages, model=model, max_tokens=max_tokens, temperature=temperature
                 )
             raise LLMError(f"request rejected: {e}") from e
+        except self._openai.APITimeoutError as e:
+            # Subclass of APIConnectionError, but the server is up, just slow (or busy with
+            # queued requests): fail this request only, not the whole run.
+            raise LLMError(f"request timed out after {self.settings.timeout:.0f}s") from e
         except self._openai.APIConnectionError as e:
             raise LLMUnavailableError(f"cannot reach {self.settings.base_url}: {e}") from e
         except self._openai.APIError as e:

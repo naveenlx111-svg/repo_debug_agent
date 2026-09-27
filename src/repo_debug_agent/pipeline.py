@@ -22,6 +22,7 @@ from repo_debug_agent.llm import (
 )
 from repo_debug_agent.models import Chunk, FixResult, FixStatus
 from repo_debug_agent.report import RunReport, write_outputs
+from repo_debug_agent.repro import Reproducer
 from repo_debug_agent.retrieval import (
     ContextRetriever,
     SymbolIndex,
@@ -170,6 +171,10 @@ def run(settings: AgentSettings, llm: ChatModel | None = None, ui: UI | None = N
             report.results = [FixResult(i, FixStatus.REPORTED) for i in selected]
         elif selected:
             ui.stage(f"Fixing {len(selected)} issue(s)")
+            reproducer = None
+            if settings.repro and any(by_rel[i.file].language.name == "python" for i in selected):
+                reproducer = Reproducer(llm, fix_model, workspace, settings.python)
+                ui.detail(f"reproducing Python bugs with {reproducer.python}")
             fixer = Fixer(
                 llm,
                 fix_model,
@@ -179,6 +184,7 @@ def run(settings: AgentSettings, llm: ChatModel | None = None, ui: UI | None = N
                 tests,
                 settings.max_attempts,
                 settings.llm.temperature,
+                reproducer,
             )
             for n, issue in enumerate(selected):
                 ui.fix_started(issue)

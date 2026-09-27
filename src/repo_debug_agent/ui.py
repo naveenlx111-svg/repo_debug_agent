@@ -112,6 +112,8 @@ class UI:
         )
         if result.explanation:
             self.console.print(f"      [dim]{escape(result.explanation)}[/]")
+        if result.repro_status:
+            self.detail(f"reproduction: {result.repro_status.replace('_', ' ')}")
         if result.status == FixStatus.FIXED:
             self.detail(
                 f"verified by: {VERIFIED_LABEL.get(result.verified_by, result.verified_by)}"

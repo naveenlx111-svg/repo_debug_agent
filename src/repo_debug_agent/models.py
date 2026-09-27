@@ -88,9 +88,12 @@ class FixResult:
     status: FixStatus
     explanation: str = ""
     diff: str = ""
-    # How the accepted change was verified: "tests" | "syntax" | "none"
+    # How the accepted change was verified: "tests" | "repro" | "no-regressions" | "syntax" | "none"
     verified_by: str = "none"
     attempts: list[Attempt] = field(default_factory=list)
+    # "reproduced" | "not_reproduced" | "unavailable" | "" (not attempted), and the script used
+    repro_status: str = ""
+    repro_script: str = ""
 
     def to_dict(self) -> dict:
         data = asdict(self)

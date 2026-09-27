@@ -52,3 +52,11 @@ def test_cli_accepts_positional_and_legacy_repo_flag(tmp_path, monkeypatch):
 def test_non_numeric_timeout_is_a_config_error():
     with pytest.raises(ConfigError, match="LLM_TIMEOUT"):
         LLMSettings.resolve(env={"LLM_TIMEOUT": "soon"})
+
+
+def test_workers_default_depends_on_provider(tmp_path):
+    groq = LLMSettings.resolve(env={"GROQ_API_KEY": "k"})
+    local = LLMSettings.resolve(env={})
+    assert AgentSettings(repo=tmp_path, llm=groq, out_dir=tmp_path).workers == 4
+    assert AgentSettings(repo=tmp_path, llm=local, out_dir=tmp_path).workers == 1
+    assert AgentSettings(repo=tmp_path, llm=local, out_dir=tmp_path, workers=3).workers == 3
