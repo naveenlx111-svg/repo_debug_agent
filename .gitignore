@@ -3,17 +3,25 @@ venv/
 .venv/
 env/
 
-# API keys 
+# API keys
 .env
 
-# Python cache
+# Python cache / build
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
 
 # ChromaDB index (large, rebuild locally)
 .agent_index/
+
+# Agent output
+debug_reports/
+debug_report_*.json
 
 # Model cache (huge)
 .cache/
