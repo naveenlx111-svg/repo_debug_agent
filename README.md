@@ -26,17 +26,24 @@ scan → index → baseline tests → review → reproduce → fix ⟲ verify �
      only embed chunks that changed.
 4. **Baseline tests** (with `--test-cmd`). Runs your suite once in a sandbox copy of the
    repo. Failing output is fed to the reviewer and fixer as evidence.
-5. **Review.** Static checks (pyflakes: undefined names, etc.) plus an LLM review of every
-   non-test file. The model has to *trace* each suspicion on a concrete input before
-   confirming it, which cuts false positives. Findings are mapped to the exact function
-   they live in, and several findings in one function are merged into one fix.
+5. **Review.** Static checks (pyflakes: undefined names, invalid escapes, etc.) plus an LLM
+   review of every non-test file. The model has to *trace* each suspicion on a concrete
+   input before confirming it, which cuts false positives. Findings are mapped to the exact
+   function they live in, and several findings in one function are merged into one fix.
+   If a small model starts looping and hits the token limit, the complete findings it
+   produced before that are kept. Reviews are cached, so re-runs only re-review changed code.
 6. **Reproduce** (Python). Before fixing, the model writes a small script that demonstrates
-   the bug, and the agent runs it against the current code in the sandbox. A script that
-   *passes* is evidence the report is wrong, so the issue is dismissed after one revision
-   attempt. A script that fails inside the target code, or on an assertion, confirms the
-   bug; its output goes into the fix prompt, and the fix has to make it pass. That gives a
-   behavioural check even in repos without a test suite. Bugs that can't be scripted
-   (leaks, races) fall back to the usual checks.
+   the bug, using only inputs the real callers can produce (it is shown how the code is
+   called) and no mocks (scripts that use them are rejected). The agent runs it against the
+   current code in the sandbox:
+   - the script **passes**: evidence the report is wrong, so after one revision attempt the
+     issue is dismissed;
+   - it **fails** inside the target code or on an assertion: its output goes into the fix
+     prompt, and a fix is accepted only once the script passes;
+   - it **can't run**, or the bug can't be scripted (leaks, races): the usual checks apply.
+
+   Treat a script as a claim, not proof: a small model can assert the wrong expectation.
+   That's why the script is included in the report, where it's the quickest thing to check.
 7. **Fix loop.** For each issue, the model gets the function, the rest of the file, related
    code from the index and any failing tests. It must answer
    `ANALYSIS → VERDICT → code → EXPLANATION`, so it can also reject a false report. The new
@@ -121,6 +128,7 @@ git -C REPO apply debug_reports/<run>/fixes.patch   # ...or apply the patch your
 | `--no-embeddings` | off | structural retrieval only |
 | `--embed-model NAME` | `default` | or any sentence-transformers model (`pip install -e ".[st]"`) |
 | `--reindex` | off | rebuild the semantic index from scratch |
+| `--no-cache` | off | re-review every file; by default, reviews of unchanged code are reused |
 | `--workers N` | 4 (groq), 1 (local) | parallel file reviews; raise it only if your local server has several slots (`--parallel`) |
 | `--out DIR` | `./debug_reports` | reports, patch and transcript go in a timestamped subfolder |
 | `-v` | off | stage timings and more detail |
@@ -148,11 +156,15 @@ See `.env.example`.
   (tests ran, but none covered the bug), `syntax`, or `none`
   (no checker for that language). **Review anything not verified by tests.**
 
-## Results on the sample repo
+## Results
+
+All numbers below are from **Qwen3.5-9B Q4_K_M** on an 8 GB laptop GPU (~38 tokens/s).
+
+### Sample repo (planted bugs, with tests)
 
 `examples/sample_repo` has 8 realistic planted bugs (no hint comments), some correct
 code the agent should leave alone, and a test suite that pins the right behaviour
-(8 failing tests). With **Qwen3.5-9B Q4_K_M** on an 8 GB laptop GPU:
+(8 failing tests).
 
 ```bash
 repo-debug-agent examples/sample_repo --provider local --test-cmd "python -m pytest -q"
@@ -161,24 +173,45 @@ repo-debug-agent examples/sample_repo --provider local --test-cmd "python -m pyt
 | | |
 | --- | --- |
 | Bugs found | 7 / 8 (missed: the unclosed file in `word_count`) |
-| False positives | 0 |
-| Fixed | 7 / 7, each on the first attempt, all minimal one- or two-line changes |
+| Fixed | 7 / 7, first attempt each, minimal one- or two-line changes; 6 of 7 also reproduced by a script |
+| False reports | 1 (`Cart.add`, confused by cascading test failures), dismissed by the fixer |
 | Tests | 8 failing → all passing |
-| Time | ~2 minutes, 11 LLM calls |
+| Time | ~3 minutes, 19 LLM calls |
+
+### Real code, no tests (the hard case)
+
+The agent's own source (22 files), with no test command, so reproduction and syntax checks
+are the only safeguards. Two runs from the *same* cached findings, with reproduction off
+and on:
+
+| | reproduction off | reproduction on |
+| --- | --- | --- |
+| Real bug found and fixed (empty `LLM_TIMEOUT` rejected) | yes, syntax-checked | yes, **verified by a script** |
+| Unneeded edits to correct code | 5 | 4 |
+| Edits that broke correct logic | 1 | **0** |
+| False reports correctly dismissed | 2 | **5** |
+| Fix stage | 17 LLM calls, 24 min | 24 calls (13 for reproduction), 20 min |
+
+Across two rounds: without reproduction 16 of 29 attempted issues ended in unneeded
+edits (2 harmful); with it, 10 of 26 (none harmful).
 
 ## Limitations
 
 - **Small models over-report on real code.** On production-quality code a 7–9B model
-  flags plausible-sounding non-bugs. The reviewer's self-check and the fixer's verdict
-  step catch many of these, but not all. A test suite is what makes the output
-  trustworthy. Without one, treat the patch as suggestions, and consider a larger
-  `--fix-model`.
+  flags plausible-sounding non-bugs. The reviewer's self-check, reproduction and the
+  fixer's verdict catch many, and reproduction stops the harmful ones, but defensive
+  noise still gets through: extra guards for conditions that can't happen, mostly in code
+  too entangled to script. A test suite is what makes the output trustworthy. Without
+  one, treat the patch as suggestions, and consider a larger `--fix-model`.
+- A reproduction script is the model's claim, not proof. It can use an input the real
+  callers never produce, or assert the wrong expectation. The script is in the report
+  so you can check it quickly.
 - Fixes rewrite one function (or class, or block of module code) at a time. Bugs
   that need coordinated edits across several functions or files are out of scope, and
   functions over 300 lines are skipped.
 - Chunking for non-Python languages is structural, not a full parser. It handles
   common styles well but can mis-split unusual code (JS regex literals containing
-  braces, macros).
+  braces, macros). Reproduction is Python-only.
 - Syntax verification needs the language's tool on `PATH` (`node`, `gofmt`, `javac`,
   `gcc`/`g++`, `ruby`, `php`). Python is always checked.
 
@@ -187,6 +220,7 @@ repo-debug-agent examples/sample_repo --provider local --test-cmd "python -m pyt
 ```
 src/repo_debug_agent/
   cli.py          argument parsing, logging, exit codes
+  cache.py        review reply cache (re-runs skip unchanged code)
   config.py       settings + provider presets (no env/network access at import time)
   pipeline.py     orchestration of the stages
   crawler.py      file discovery (.gitignore-aware)
@@ -209,6 +243,6 @@ examples/sample_repo/
 
 ```bash
 pip install -e ".[rag,dev]"
-pytest            # ~110 tests, offline, a few seconds
+pytest            # ~130 tests, offline, a few seconds
 ruff check src tests && ruff format src tests
 ```

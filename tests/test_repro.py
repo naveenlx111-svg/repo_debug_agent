@@ -112,7 +112,8 @@ def test_reproduced_bug_is_fixed_and_verified_by_the_script(repo, make_settings)
     fix_prompt = next(
         c for c in llm.calls if "Report:" in c[1]["content"] and not is_repro_request(c)
     )[1]["content"]
-    assert "## Reproduction (verified)" in fix_prompt and "ZeroDivisionError" in fix_prompt
+    assert "## Reproduction attempt" in fix_prompt and "ZeroDivisionError" in fix_prompt
+    assert "real callers" in fix_prompt  # the fixer is asked to vet the script, not trust it
 
 
 def test_unreproducible_report_is_dismissed_without_a_fix_attempt(repo, make_settings):
@@ -177,3 +178,26 @@ def test_a_misbehaving_script_cannot_corrupt_the_repo_or_the_sandbox(repo, make_
     assert [a.outcome for a in result.attempts] == ["rejected_repro"] * 3
     assert "oops" not in result.attempts[0].detail
     assert (repo / "calc.py").read_text() == CALC
+
+
+def test_uses_mocks():
+    from repo_debug_agent.repro import uses_mocks
+
+    assert uses_mocks("from unittest.mock import MagicMock")
+    assert uses_mocks("from unittest import mock\nmock.patch('x')")
+    assert uses_mocks("import mock")
+    assert not uses_mocks("from calc import average\nassert average([1]) == 1")
+    assert not uses_mocks("mockingbird = 1")
+
+
+def test_mock_based_scripts_are_never_accepted_as_reproductions(repo, make_settings):
+    mocked = script(
+        "from unittest.mock import MagicMock\nimport calc\n"
+        "calc.average = MagicMock(side_effect=ZeroDivisionError)\ncalc.average([1])"
+    )
+    llm = scripted([AVERAGE], [mocked, mocked], [fix_reply(GOOD_FIX)])
+    report = run(settings(make_settings, repo), llm=llm, ui=UI.silent())
+    [result] = report.results
+    assert result.repro_status == "unavailable" and result.verified_by == "syntax"
+    feedback = next(c for c in llm.calls if len(c) == 4 and is_repro_request(c))[3]["content"]
+    assert "mocks" in feedback

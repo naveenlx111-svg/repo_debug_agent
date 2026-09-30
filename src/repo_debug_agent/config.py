@@ -100,7 +100,7 @@ class LLMSettings:
 
         if timeout is None:
             try:
-                timeout = float(env.get("LLM_TIMEOUT", 300))
+                timeout = float(env.get("LLM_TIMEOUT", "").strip() or 300)  # empty = unset
             except ValueError as e:
                 raise ConfigError(f"LLM_TIMEOUT must be a number of seconds: {e}") from e
 
@@ -165,6 +165,7 @@ class AgentSettings:
     embed_model: str = "default"
     index_dir: Path = field(default_factory=default_index_dir)
     reindex: bool = False
+    review_cache: bool = True  # reuse review replies for unchanged review prompts
 
     def __post_init__(self) -> None:
         self.repo = Path(self.repo).expanduser().resolve()

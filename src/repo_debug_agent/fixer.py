@@ -254,7 +254,7 @@ class Fixer:
 
         repro = None
         if self.reproducer is not None and sf.language.name == "python":
-            repro = self.reproducer.reproduce(issue, chunk, excerpt)
+            repro = self.reproducer.reproduce(issue, chunk, excerpt, related)
             if repro.status == ReproStatus.NOT_REPRODUCED:
                 return FixResult(
                     issue,

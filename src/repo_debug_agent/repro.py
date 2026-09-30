@@ -9,7 +9,6 @@ have no test suite. Python only, for now.
 
 from __future__ import annotations
 
-import logging
 import re
 import shlex
 import shutil
@@ -25,8 +24,6 @@ from repo_debug_agent.llm import ChatModel, LLMError, LLMUnavailableError, Messa
 from repo_debug_agent.models import Chunk, Issue
 from repo_debug_agent.validation import TestRun, run_tests
 from repo_debug_agent.workspace import Workspace
-
-log = logging.getLogger(__name__)
 
 REPRO_TIMEOUT = 30.0
 REPRO_MAX_TOKENS = 2048
@@ -67,6 +64,16 @@ def import_line(chunk: Chunk) -> str | None:
     if chunk.name == "<module>":
         return f"import {module}"
     return f"from {module} import {chunk.name.split('.')[0]}"
+
+
+_MOCKS = re.compile(
+    r"unittest\.mock|from\s+unittest\s+import\s+mock|\bimport\s+mock\b|\bfrom\s+mock\s+import"
+    r"|\bMagicMock\b|\bcreate_autospec\b|\bmock\.patch\b|\bmonkeypatch\b"
+)
+
+
+def uses_mocks(script: str) -> bool:
+    return _MOCKS.search(script) is not None
 
 
 def find_python(repo: Path) -> str:
@@ -112,16 +119,19 @@ class Reproducer:
         run.output = run.output.replace(str(path), "reproduce_bug.py")
         return run
 
-    def reproduce(self, issue: Issue, chunk: Chunk, excerpt: str) -> Reproduction:
+    def reproduce(
+        self, issue: Issue, chunk: Chunk, excerpt: str, related: str = ""
+    ) -> Reproduction:
         """Get a failing script from the model (one retry, with feedback) and check that it
-        fails for the right reason."""
+        fails for the right reason. `related` shows how the code is really called."""
         imports = import_line(chunk)
         if chunk.language != "python" or imports is None:
             return Reproduction(ReproStatus.UNAVAILABLE, detail="not an importable Python module")
 
+        prompt = prompts.repro_prompt(issue, chunk, excerpt, imports, related)
         messages: list[Message] = [
             {"role": "system", "content": prompts.REPRO_SYSTEM},
-            {"role": "user", "content": prompts.repro_prompt(issue, chunk, excerpt, imports)},
+            {"role": "user", "content": prompt},
         ]
         passed_once = False
         calls = 0
@@ -142,34 +152,39 @@ class Reproducer:
                 status = ReproStatus.NOT_REPRODUCED if passed_once else ReproStatus.UNAVAILABLE
                 return Reproduction(status, detail=reason, calls=calls)
 
-            run = self.run(script, chunk.file)
-            outcome = classify(run, chunk.file)
-            log.debug("repro attempt %d for %s: %s", attempt, issue.location, outcome)
-            if outcome == "relevant":
-                return Reproduction(
-                    ReproStatus.REPRODUCED, script, run.excerpt(2000), "fails as reported", calls
-                )
-            if attempt == 2:
-                if outcome == "pass":
+            if uses_mocks(script):
+                # Mocks can make anything fail; they demonstrate the mock, not the code.
+                outcome, feedback = "mocked", prompts.repro_feedback_mocks()
+            else:
+                run = self.run(script, chunk.file)
+                outcome = classify(run, chunk.file)
+                if outcome == "relevant":
                     return Reproduction(
-                        ReproStatus.NOT_REPRODUCED,
+                        ReproStatus.REPRODUCED,
                         script,
-                        detail="the reproduction script passed against the current code",
-                        calls=calls,
+                        run.excerpt(2000),
+                        "fails as reported",
+                        calls,
                     )
-                return Reproduction(
-                    ReproStatus.UNAVAILABLE,
-                    script,
-                    detail="the reproduction script could not run",
-                    calls=calls,
+                feedback = (
+                    prompts.repro_feedback_passed()
+                    if outcome == "pass"
+                    else prompts.repro_feedback_broken(run.excerpt(1500))
                 )
 
+            if attempt == 2:
+                if outcome == "pass":
+                    detail = "the reproduction script passed against the current code"
+                    return Reproduction(
+                        ReproStatus.NOT_REPRODUCED, script, detail=detail, calls=calls
+                    )
+                detail = {
+                    "mocked": "the reproduction script relied on mocks",
+                    "broken": "the reproduction script could not run",
+                }[outcome]
+                return Reproduction(ReproStatus.UNAVAILABLE, script, detail=detail, calls=calls)
+
             passed_once = outcome == "pass"
-            feedback = (
-                prompts.repro_feedback_passed()
-                if passed_once
-                else prompts.repro_feedback_broken(run.excerpt(1500))
-            )
             messages = messages[:2] + [
                 {"role": "assistant", "content": reply},
                 {"role": "user", "content": feedback},

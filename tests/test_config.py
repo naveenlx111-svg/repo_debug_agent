@@ -49,6 +49,14 @@ def test_cli_accepts_positional_and_legacy_repo_flag(tmp_path, monkeypatch):
     assert a.repo == b.repo == tmp_path.resolve()
 
 
+def test_empty_timeout_means_default():
+    # Found by the agent reviewing its own source: every other LLM_* variable treats an
+    # empty value (e.g. `LLM_TIMEOUT=` in .env) as unset, but this one raised ConfigError.
+    assert LLMSettings.resolve(env={"LLM_TIMEOUT": ""}).timeout == 300
+    assert LLMSettings.resolve(env={"LLM_TIMEOUT": "  "}).timeout == 300
+    assert LLMSettings.resolve(env={"LLM_TIMEOUT": "60"}).timeout == 60
+
+
 def test_non_numeric_timeout_is_a_config_error():
     with pytest.raises(ConfigError, match="LLM_TIMEOUT"):
         LLMSettings.resolve(env={"LLM_TIMEOUT": "soon"})

@@ -122,9 +122,11 @@ def fix_prompt(
     if repro:
         script, output = repro
         sections.append(
-            "## Reproduction (verified)\n"
-            "This script was run against the current code and fails, which confirms the bug. "
-            "Your fix must make it pass.\n"
+            "## Reproduction attempt\n"
+            "The reviewer wrote this script and it fails against the current code. First check "
+            "that its inputs are ones the real callers can produce and that its assertion matches "
+            "how the code is meant to behave. If not, the report is still wrong: answer NOT_A_BUG. "
+            "If it is a real bug, your fix must make this script pass.\n"
             f"```{fence}\n{script.rstrip()}\n```\nOutput:\n```\n{output}\n```"
         )
     import_note = (
@@ -184,23 +186,33 @@ REPRO_SYSTEM = (
 )
 
 
-def repro_prompt(issue: Issue, chunk: Chunk, file_excerpt: str, imports: str) -> str:
+def repro_prompt(
+    issue: Issue, chunk: Chunk, file_excerpt: str, imports: str, related: str = ""
+) -> str:
     line = f" (line {issue.line})" if issue.line else ""
+    usage = f"## How this code is used elsewhere\n{related}\n\n" if related else ""
     return (
         f"An automated reviewer suspects a bug in `{chunk.file}`{line}. Automated reviewers are "
         "often wrong.\n"
         f"- Report: {issue.description}\n\n"
         f"## The code in question: {describe_target(chunk)}\n```python\n{chunk.code}\n```\n\n"
         f"## Rest of the file, for reference\n```python\n{file_excerpt}\n```\n\n"
+        f"{usage}"
         "## Task\n"
         "Write a short standalone Python script that demonstrates the bug by running the real code.\n"
         f"- Import the code with: `{imports}` (it runs from the repository root, which is on sys.path).\n"
-        "- Call it with the input that triggers the bug, and `assert` what correct code must do.\n"
+        "- Use only inputs the code can really receive: values its real callers could pass. "
+        "Calling it with arguments that break how the rest of the code uses it (wrong types, "
+        "impossible shapes, internal objects built by hand to be invalid) does not show a bug.\n"
+        "- Do not use mocks, fakes or monkeypatching: they make anything fail.\n"
+        "- `assert` the behaviour the code is clearly meant to have (from its name, docstring, "
+        "callers and tests), not what you would prefer.\n"
         "- While the bug exists the script must fail (AssertionError or the reported exception); "
         "once the bug is fixed it must pass.\n"
         "- No test framework, no network, no files outside a temporary directory, under 30 lines.\n\n"
-        "If the problem can't be shown by running code (a leak, a race) or you conclude the code "
-        "is actually correct, reply with one line: NOT_REPRODUCIBLE: <reason>\n"
+        "If the problem can't be shown this way (a leak, a race, or only with impossible inputs) "
+        "or you conclude the code is actually correct, reply with one line: "
+        "NOT_REPRODUCIBLE: <reason>\n"
         "Otherwise reply with only the script, in one ```python code block."
     )
 
@@ -217,4 +229,12 @@ def repro_feedback_broken(output: str) -> str:
     return (
         "Your script failed for an unrelated reason, before reaching the code in question:\n"
         f"```\n{output}\n```\nFix the script and reply with it again, in one ```python block."
+    )
+
+
+def repro_feedback_mocks() -> str:
+    return (
+        "Your script uses mocks or monkeypatching. A mock can make any code fail, so it "
+        "demonstrates the mock, not a bug. Rewrite it to run the real code with inputs its real "
+        "callers could pass, or reply NOT_REPRODUCIBLE: <reason> if that can't show the bug."
     )

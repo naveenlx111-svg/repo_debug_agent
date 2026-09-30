@@ -195,3 +195,46 @@ def test_truncated_review_is_split_and_retried():
     covered = sorted(w for w in windows[1:] if w[1] - w[0] <= 60)
     assert covered[0][0] == 1 and covered[-1][1] == 89
     assert len(review.issues) == len(covered)
+
+
+def test_truncated_review_keeps_complete_findings_instead_of_losing_the_file():
+    from repo_debug_agent.llm import LLMTruncatedError
+
+    src = "def f(x):\n    return x[0]\n\n\ndef g(x):\n    return x[1]\n"
+    sf = SourceFile(path=None, rel="m.py", language=BY_NAME["python"], is_test=False)
+    partial = (
+        '{"issues": [{"line": 2, "symbol": "f", "confirmed": true, "confidence": 0.9, '
+        '"description": "IndexError on []"}, {"line": 5, "trace": "Wait... No. Wait'
+    )
+    calls = []
+
+    def respond(messages, json_mode):
+        calls.append(1)
+        raise LLMTruncatedError("cut off", partial=partial)
+
+    review = Analyzer(ScriptedLLM(respond), "fake", 400).review(
+        sf, src, chunk_source("m.py", src, sf.language)
+    )
+    assert [i.symbol for i in review.issues] == ["f"]
+    assert "kept its 1 complete finding" in review.error
+    assert len(calls) == 1  # salvaged, so no split-and-retry
+
+
+def test_finished_reply_with_broken_json_keeps_every_complete_finding():
+    src = "def f(x):\n    return x[0]\n\n\ndef g(x):\n    return x[1]\n"
+    sf = SourceFile(path=None, rel="m.py", language=BY_NAME["python"], is_test=False)
+    broken = (
+        '{"issues": [{"line": 2, "description": "IndexError in f"}, '
+        '{"line": 6, "description": "IndexError in g"}, {"line": ": ", "trace": "}'
+    )
+    review = Analyzer(ScriptedLLM(lambda m, j: broken), "fake", 400).review(
+        sf, src, chunk_source("m.py", src, sf.language)
+    )
+    assert sorted(i.symbol for i in review.issues) == ["f", "g"]
+
+
+def test_review_token_cap_scales_with_window():
+    from repo_debug_agent.analyzer import REVIEW_MAX_TOKENS, review_max_tokens
+
+    assert review_max_tokens(33) < 1500  # a loop in a small file stops early
+    assert review_max_tokens(400) == REVIEW_MAX_TOKENS

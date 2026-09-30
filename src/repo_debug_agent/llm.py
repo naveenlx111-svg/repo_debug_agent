@@ -26,7 +26,11 @@ class LLMError(RuntimeError):
 
 
 class LLMTruncatedError(LLMError):
-    """The reply hit max_tokens before finishing."""
+    """The reply hit max_tokens before finishing. `partial` is what was generated."""
+
+    def __init__(self, message: str, partial: str = ""):
+        super().__init__(message)
+        self.partial = partial
 
 
 class LLMUnavailableError(LLMError):
@@ -126,7 +130,10 @@ class OpenAICompatibleLLM:
 
         choice = response.choices[0]
         if choice.finish_reason == "length":
-            raise LLMTruncatedError(f"reply was cut off at max_tokens={max_tokens}")
+            raise LLMTruncatedError(
+                f"reply was cut off at max_tokens={max_tokens}",
+                partial=strip_reasoning(choice.message.content or ""),
+            )
         text = strip_reasoning(choice.message.content or "")
         if not text:
             raise LLMError(
@@ -157,6 +164,7 @@ class RecordingLLM:
             return reply
         except LLMError as e:
             error = str(e)
+            reply = getattr(e, "partial", None) or None  # keep what a cut-off reply said
             raise
         finally:
             record = {
@@ -218,6 +226,28 @@ def parse_json(text: str) -> Any:
         if isinstance(value, (dict, list)):
             return value
     raise ValueError("no JSON value found in model reply")
+
+
+def salvage_array_items(text: str, field: str) -> list[dict]:
+    """Complete objects from the `field` array of a JSON reply that broke off part-way
+    (token limit, or a model that started looping after its useful answers)."""
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*\[', text)
+    if match is None:
+        return []
+    decoder = json.JSONDecoder()
+    items: list[dict] = []
+    i = match.end()
+    while True:
+        while i < len(text) and text[i] in " \t\r\n,":
+            i += 1
+        if i >= len(text) or text[i] != "{":
+            return items
+        try:
+            value, i = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            return items
+        if isinstance(value, dict):
+            items.append(value)
 
 
 def extract_code_blocks(text: str) -> list[tuple[str, str]]:

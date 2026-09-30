@@ -100,6 +100,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     g.add_argument("--index-dir", type=Path, help="where the vector index lives")
     g.add_argument("--reindex", action="store_true", help="rebuild the vector index from scratch")
+    g.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="re-review every file instead of reusing cached reviews of unchanged code",
+    )
     return p
 
 
@@ -135,6 +140,7 @@ def settings_from_args(args: argparse.Namespace) -> AgentSettings:
         use_embeddings=not args.no_embeddings,
         embed_model=args.embed_model,
         reindex=args.reindex,
+        review_cache=not args.no_cache,
         **extra,
     )
 

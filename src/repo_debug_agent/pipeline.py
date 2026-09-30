@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from repo_debug_agent.analyzer import Analyzer, FileReview, consolidate, select
+from repo_debug_agent.cache import ReplyCache
 from repo_debug_agent.chunker import chunk_source
 from repo_debug_agent.config import AgentSettings, ConfigError, LLMSettings
 from repo_debug_agent.crawler import SourceFile, discover
@@ -147,8 +148,11 @@ def run(settings: AgentSettings, llm: ChatModel | None = None, ui: UI | None = N
         targets = [f for f in files if settings.include_tests or not f.is_test]
         report.files_reviewed = len(targets)
         ui.stage(f"Reviewing {len(targets)} files")
-        analyzer = Analyzer(llm, triage_model, settings.review_max_lines)
+        cache = ReplyCache(settings.index_dir.parent / "reviews") if settings.review_cache else None
+        analyzer = Analyzer(llm, triage_model, settings.review_max_lines, cache)
         reviews = _review_all(analyzer, targets, sources, chunks, tests, settings.workers, ui)
+        if cache and cache.hits:
+            ui.info(f"{cache.hits} review(s) reused from cache (--no-cache to redo them)")
         for review in reviews:
             if review.error:
                 report.warnings.append(f"{review.file}: {review.error}")

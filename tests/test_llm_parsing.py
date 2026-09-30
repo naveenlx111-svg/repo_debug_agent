@@ -40,3 +40,17 @@ def test_pick_code_block_ignores_fences_inside_code_lines():
 
 def test_pick_code_block_none_when_unterminated():
     assert pick_code_block("```python\ndef f():\n    return 1\n") is None
+
+
+def test_salvage_array_items_keeps_complete_objects_before_the_break():
+    from repo_debug_agent.llm import salvage_array_items
+
+    # Shape seen from Qwen3.5-9B: two good findings, then a loop until the token limit.
+    looping = (
+        '{"issues": [{"line": 14, "description": "shared default"}, '
+        '{"line": 28, "description": "ignores quantity"}, '
+        '{"line": 20, "trace": "Wait, the test says 8. No. Maybe... Wait, the test says 8. No'
+    )
+    assert [i["line"] for i in salvage_array_items(looping, "issues")] == [14, 28]
+    assert salvage_array_items('{"issues": [', "issues") == []
+    assert salvage_array_items("no json", "issues") == []

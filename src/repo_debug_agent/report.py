@@ -19,7 +19,8 @@ STATUS_ICON = {
 }
 VERIFIED_LABEL = {
     "tests": "test suite (improved)",
-    "repro": "reproduction script (failed before the fix, passes after)",
+    "repro": "a model-written reproduction script (failed before, passes after); "
+    "check that its assertion is the intended behaviour",
     "no-regressions": "test suite (no regressions; no test covered the bug)",
     "syntax": "syntax + static checks only",
     "none": "not verified (no checker for this language)",

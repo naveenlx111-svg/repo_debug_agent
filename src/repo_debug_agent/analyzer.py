@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from repo_debug_agent import prompts
+from repo_debug_agent.cache import ReplyCache
 from repo_debug_agent.crawler import SourceFile
 from repo_debug_agent.llm import (
     ChatModel,
@@ -21,6 +22,7 @@ from repo_debug_agent.llm import (
     LLMTruncatedError,
     LLMUnavailableError,
     parse_json,
+    salvage_array_items,
 )
 from repo_debug_agent.models import SEVERITIES, SEVERITY_RANK, Chunk, Issue
 from repo_debug_agent.validation import python_findings
@@ -40,10 +42,11 @@ class FileReview:
 
 
 class Analyzer:
-    def __init__(self, llm: ChatModel, model: str, max_lines: int):
+    def __init__(self, llm: ChatModel, model: str, max_lines: int, cache: ReplyCache | None = None):
         self.llm = llm
         self.model = model
         self.max_lines = max_lines
+        self.cache = cache
 
     def review(
         self, sf: SourceFile, source: str, chunks: list[Chunk], test_output: str | None = None
@@ -97,27 +100,81 @@ class Analyzer:
             {"role": "system", "content": prompts.REVIEW_SYSTEM},
             {"role": "user", "content": prompt},
         ]
+        max_tokens = review_max_tokens(end - start + 1)
+        key = self.cache.key(self.model, messages, max_tokens=max_tokens) if self.cache else ""
+        cached = self.cache.get(key) if self.cache else None
         try:
-            reply = self.llm.complete(
-                messages, model=self.model, max_tokens=REVIEW_MAX_TOKENS, json_mode=True
-            )
-            review.issues.extend(parse_review(parse_json(reply), sf.rel, (start, end)))
+            if cached is not None:
+                reply, truncated = cached
+            else:
+                try:
+                    reply = self.llm.complete(
+                        messages, model=self.model, max_tokens=max_tokens, json_mode=True
+                    )
+                    truncated = False
+                except LLMTruncatedError as e:
+                    reply, truncated = e.partial, True
+
+            if truncated:
+                if cached is None and self.cache:
+                    self.cache.put(key, reply, truncated=True)
+                self._handle_truncated(
+                    sf, lines, start, end, chunks, hints, test_output, review, reply
+                )
+                return
+
+            data = parse_json(reply)
+            if not (isinstance(data, dict) and "issues" in data):
+                # A reply that finished but whose JSON broke part-way: keep the complete findings.
+                salvaged = salvage_array_items(reply, "issues")
+                if salvaged:
+                    data = {"issues": salvaged}
+            if cached is None and self.cache:
+                self.cache.put(key, reply)  # only replies that parsed are worth keeping
+            review.issues.extend(parse_review(data, sf.rel, (start, end)))
         except LLMUnavailableError:
             raise
-        except LLMTruncatedError:
-            if end - start + 1 < 2 * MIN_SPLIT_LINES:
-                review.error = f"review of lines {start}-{end} was cut off"
-                return
-            # Too much to say about this much code: review each half separately.
-            middle = (start + end) // 2
-            cuts = [c.start_line for c in chunks if start + MIN_SPLIT_LINES <= c.start_line <= end]
-            mid = min(cuts, key=lambda c: abs(c - middle)) if cuts else middle
-            log.info("%s: review of %d-%d truncated; splitting at %d", sf.rel, start, end, mid)
-            self._review_window(sf, lines, start, mid - 1, chunks, hints, test_output, review)
-            self._review_window(sf, lines, mid, end, chunks, hints, test_output, review)
         except (LLMError, ValueError) as e:
             review.error = f"review of lines {start}-{end} failed: {e}"
             log.warning("%s: %s", sf.rel, review.error)
+
+    def _handle_truncated(
+        self,
+        sf: SourceFile,
+        lines: list[str],
+        start: int,
+        end: int,
+        chunks: list[Chunk],
+        hints: list[str],
+        test_output: str | None,
+        review: FileReview,
+        partial: str,
+    ) -> None:
+        """A review that hit the token limit, usually because the model started looping after
+        its real findings. Keep the complete findings; with none, retry on smaller windows."""
+        salvaged = salvage_array_items(partial, "issues")
+        if salvaged:
+            review.issues.extend(parse_review({"issues": salvaged}, sf.rel, (start, end)))
+            review.error = (
+                f"review of lines {start}-{end} was cut off; kept its {len(salvaged)} "
+                "complete finding(s)"
+            )
+            return
+        if end - start + 1 < 2 * MIN_SPLIT_LINES:
+            review.error = f"review of lines {start}-{end} was cut off with no complete findings"
+            return
+        middle = (start + end) // 2
+        cuts = [c.start_line for c in chunks if start + MIN_SPLIT_LINES <= c.start_line <= end]
+        mid = min(cuts, key=lambda c: abs(c - middle)) if cuts else middle
+        log.info("%s: review of %d-%d truncated; splitting at %d", sf.rel, start, end, mid)
+        self._review_window(sf, lines, start, mid - 1, chunks, hints, test_output, review)
+        self._review_window(sf, lines, mid, end, chunks, hints, test_output, review)
+
+
+def review_max_tokens(window_lines: int) -> int:
+    """Room for several findings with traces. Smaller windows get a smaller cap, so a model
+    stuck in a repetition loop is cut off after seconds rather than minutes."""
+    return min(REVIEW_MAX_TOKENS, 1024 + 12 * window_lines)
 
 
 def review_windows(total: int, chunks: list[Chunk], max_lines: int) -> list[tuple[int, int]]:
