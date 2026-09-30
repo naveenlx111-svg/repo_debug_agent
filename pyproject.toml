@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repo-debug-agent"
+version = "0.2.0"
+description = "Autonomous codebase debugging agent: LLM review + RAG context + fixes verified by syntax checks and your test suite."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40",
+    "python-dotenv>=1.0",
+    "pyflakes>=3.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+# Semantic retrieval. Uses Chroma's bundled ONNX MiniLM embedder by default (no torch).
+rag = ["chromadb>=0.5"]
+# Only needed for --embed-model <sentence-transformers model name>.
+st = ["chromadb>=0.5", "sentence-transformers>=2.7"]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[project.scripts]
+repo-debug-agent = "repo_debug_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["examples", ".venv", "venv"]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["examples"]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/repo_debug_agent/prompts.py" = ["E501"]  # prompt text reads better unwrapped
