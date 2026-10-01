@@ -217,3 +217,39 @@ def test_llm_outage_stops_cleanly(repo, make_settings):
     report = run(make_settings(repo), llm=ScriptedLLM(respond), ui=UI.silent())
     assert [r.status for r in report.results] == [FixStatus.SKIPPED, FixStatus.SKIPPED]
     assert any("unavailable" in w for w in report.warnings)
+
+
+def test_runaway_fix_reply_with_complete_code_is_used(repo, make_settings):
+    from repo_debug_agent.llm import LLMTruncatedError
+
+    partial = fix_reply(GOOD_FIX) + "\nAlso, wait, let me reconsider. Wait, let me reconsider. Wait"
+
+    def respond(messages, json_mode):
+        if json_mode:
+            return review_reply(AVERAGE_ISSUE)
+        raise LLMTruncatedError("cut off", partial=partial)
+
+    report = run(make_settings(repo, test_cmd=PYTEST_CMD), llm=ScriptedLLM(respond), ui=UI.silent())
+    [result] = report.results
+    assert result.status == FixStatus.FIXED and result.verified_by == "tests"
+
+
+def test_runaway_fix_reply_without_code_is_retried_with_a_nudge(repo, make_settings):
+    from repo_debug_agent.llm import LLMTruncatedError
+
+    calls = []
+
+    def respond(messages, json_mode):
+        if json_mode:
+            return review_reply(AVERAGE_ISSUE)
+        calls.append(messages)
+        if len(calls) == 1:
+            raise LLMTruncatedError("cut off", partial="ANALYSIS: Wait... no. Wait... " * 200)
+        return fix_reply(GOOD_FIX)
+
+    report = run(make_settings(repo, test_cmd=PYTEST_CMD), llm=ScriptedLLM(respond), ui=UI.silent())
+    [result] = report.results
+    assert [a.outcome for a in result.attempts] == ["llm_error", "applied"]
+    retry = calls[1]
+    assert "stuck repeating itself" in retry[3]["content"]
+    assert len(retry[2]["content"]) < 700  # the loop isn't fed back in full

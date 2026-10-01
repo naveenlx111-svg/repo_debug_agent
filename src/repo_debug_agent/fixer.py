@@ -23,6 +23,7 @@ from repo_debug_agent.crawler import SourceFile
 from repo_debug_agent.llm import (
     ChatModel,
     LLMError,
+    LLMTruncatedError,
     LLMUnavailableError,
     Message,
     pick_code_block,
@@ -44,7 +45,7 @@ from repo_debug_agent.workspace import Workspace, unified_diff
 
 log = logging.getLogger(__name__)
 
-FIX_MAX_TOKENS = 4096
+FIX_MAX_TOKENS = 4096  # upper bound; see fix_max_tokens
 MAX_REWRITE_LINES = (
     300  # beyond this, asking a model to reproduce the whole unit is too error-prone
 )
@@ -211,6 +212,18 @@ def _static_findings_resolved(sf: SourceFile, before: str, after: str) -> bool:
     return len(python_findings(after, sf.rel)) < len(python_findings(before, sf.rel))
 
 
+def fix_max_tokens(chunk: Chunk) -> int:
+    """Room for a short analysis, the rewritten code (about 3 characters per token, with
+    slack for added lines) and the explanation. Sized to the code, so a model that starts
+    repeating itself is stopped after seconds rather than minutes."""
+    return min(FIX_MAX_TOKENS, 768 + 2 * len(chunk.code) // 3)
+
+
+def _clip(reply: str, limit: int = 600) -> str:
+    """The start of a runaway reply, so the retry sees what went wrong without the loop."""
+    return reply if len(reply) <= limit else reply[:limit] + "\n[... cut off: it kept repeating]"
+
+
 def _with_feedback(base: list[Message], reply: str, feedback: str) -> list[Message]:
     """The original request plus only the latest failed exchange (keeps small contexts small)."""
     return base + [
@@ -312,10 +325,20 @@ class Fixer:
             temperature = min(self.base_temperature + 0.2 * (n - 1), 0.7)
             try:
                 reply = self.llm.complete(
-                    messages, model=self.model, max_tokens=FIX_MAX_TOKENS, temperature=temperature
+                    messages,
+                    model=self.model,
+                    max_tokens=fix_max_tokens(chunk),
+                    temperature=temperature,
                 )
             except LLMUnavailableError:
                 raise
+            except LLMTruncatedError as e:
+                # A model that starts repeating itself has often written the code already.
+                if pick_code_block(e.partial) is None:
+                    attempts.append(Attempt(n, "llm_error", "the answer kept repeating itself"))
+                    messages = _with_feedback(base, _clip(e.partial), prompts.feedback_rambling())
+                    continue
+                reply = e.partial
             except LLMError as e:
                 attempts.append(Attempt(n, "llm_error", str(e)))
                 continue

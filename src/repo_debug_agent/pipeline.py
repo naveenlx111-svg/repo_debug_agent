@@ -149,7 +149,9 @@ def run(settings: AgentSettings, llm: ChatModel | None = None, ui: UI | None = N
         report.files_reviewed = len(targets)
         ui.stage(f"Reviewing {len(targets)} files")
         cache = ReplyCache(settings.index_dir.parent / "reviews") if settings.review_cache else None
-        analyzer = Analyzer(llm, triage_model, settings.review_max_lines, cache)
+        analyzer = Analyzer(
+            llm, triage_model, settings.review_max_lines, cache, settings.review_passes
+        )
         reviews = _review_all(analyzer, targets, sources, chunks, tests, settings.workers, ui)
         if cache and cache.hits:
             ui.info(f"{cache.hits} review(s) reused from cache (--no-cache to redo them)")

@@ -33,7 +33,7 @@ REVIEW_MAX_TOKENS = 4096
 STATIC_CONFIDENCE = 0.95
 MIN_SPLIT_LINES = 20
 # Part of the review cache key: bump when REVIEW_SCHEMA changes shape.
-REVIEW_SCHEMA_ID = "review-v1"
+REVIEW_SCHEMA_ID = "review-v2"
 
 
 @dataclass
@@ -44,11 +44,19 @@ class FileReview:
 
 
 class Analyzer:
-    def __init__(self, llm: ChatModel, model: str, max_lines: int, cache: ReplyCache | None = None):
+    def __init__(
+        self,
+        llm: ChatModel,
+        model: str,
+        max_lines: int,
+        cache: ReplyCache | None = None,
+        passes: int = 1,
+    ):
         self.llm = llm
         self.model = model
         self.max_lines = max_lines
         self.cache = cache
+        self.passes = passes  # >1: follow-up passes look for what earlier passes missed
 
     def review(
         self, sf: SourceFile, source: str, chunks: list[Chunk], test_output: str | None = None
@@ -75,7 +83,13 @@ class Analyzer:
         hints = [f"line {f.line}: {f.message}" for f in static]
 
         for start, end in review_windows(len(lines), chunks, self.max_lines):
+            first = len(review.issues)
             self._review_window(sf, lines, start, end, chunks, hints, test_output, review)
+            for pass_no in range(2, self.passes + 1):
+                prior = list(review.issues[first:])
+                self._review_window(
+                    sf, lines, start, end, chunks, hints, test_output, review, pass_no, prior
+                )
 
         for issue in review.issues:
             chunk = locate(chunks, issue.line, issue.symbol)
@@ -94,10 +108,17 @@ class Analyzer:
         hints: list[str],
         test_output: str | None,
         review: FileReview,
+        pass_no: int = 1,
+        prior: list[Issue] | None = None,
     ) -> None:
         prompt = prompts.review_prompt(
             sf.rel, sf.language.name, lines, start, end, hints, test_output
         )
+        if pass_no > 1:
+            prompt += "\n\n" + prompts.review_followup(
+                [f"line {i.line or '?'} ({i.symbol or '?'}): {i.description}" for i in prior or []]
+            )
+        source = "llm" if pass_no == 1 else f"llm-pass{pass_no}"
         messages = [
             {"role": "system", "content": prompts.REVIEW_SYSTEM},
             {"role": "user", "content": prompt},
@@ -129,7 +150,7 @@ class Analyzer:
                 if cached is None and self.cache:
                     self.cache.put(key, reply, truncated=True)
                 self._handle_truncated(
-                    sf, lines, start, end, chunks, hints, test_output, review, reply
+                    sf, lines, start, end, chunks, hints, test_output, review, reply, pass_no, prior
                 )
                 return
 
@@ -141,7 +162,7 @@ class Analyzer:
                     data = {"issues": salvaged}
             if cached is None and self.cache:
                 self.cache.put(key, reply)  # only replies that parsed are worth keeping
-            review.issues.extend(parse_review(data, sf.rel, (start, end)))
+            review.issues.extend(parse_review(data, sf.rel, (start, end), source))
         except LLMUnavailableError:
             raise
         except (LLMError, ValueError) as e:
@@ -159,12 +180,15 @@ class Analyzer:
         test_output: str | None,
         review: FileReview,
         partial: str,
+        pass_no: int = 1,
+        prior: list[Issue] | None = None,
     ) -> None:
         """A review that hit the token limit, usually because the model started looping after
         its real findings. Keep the complete findings; with none, retry on smaller windows."""
         salvaged = salvage_array_items(partial, "issues")
         if salvaged:
-            review.issues.extend(parse_review({"issues": salvaged}, sf.rel, (start, end)))
+            source = "llm" if pass_no == 1 else f"llm-pass{pass_no}"
+            review.issues.extend(parse_review({"issues": salvaged}, sf.rel, (start, end), source))
             review.error = (
                 f"review of lines {start}-{end} was cut off; kept its {len(salvaged)} "
                 "complete finding(s)"
@@ -177,8 +201,10 @@ class Analyzer:
         cuts = [c.start_line for c in chunks if start + MIN_SPLIT_LINES <= c.start_line <= end]
         mid = min(cuts, key=lambda c: abs(c - middle)) if cuts else middle
         log.info("%s: review of %d-%d truncated; splitting at %d", sf.rel, start, end, mid)
-        self._review_window(sf, lines, start, mid - 1, chunks, hints, test_output, review)
-        self._review_window(sf, lines, mid, end, chunks, hints, test_output, review)
+        for lo, hi in ((start, mid - 1), (mid, end)):
+            self._review_window(
+                sf, lines, lo, hi, chunks, hints, test_output, review, pass_no, prior
+            )
 
 
 def review_max_tokens(window_lines: int) -> int:
@@ -231,7 +257,7 @@ def _as_confidence(value: Any) -> float:
     return min(max(conf, 0.0), 1.0)
 
 
-def parse_review(data: Any, rel: str, window: tuple[int, int]) -> list[Issue]:
+def parse_review(data: Any, rel: str, window: tuple[int, int], source: str = "llm") -> list[Issue]:
     """Turn a model's JSON answer into Issues, tolerating the usual shape variations."""
     items: Any = []
     if isinstance(data, dict):
@@ -272,6 +298,7 @@ def parse_review(data: Any, rel: str, window: tuple[int, int]) -> list[Issue]:
                 line=line,
                 symbol=str(symbol).strip().strip("`").removesuffix("()") if symbol else None,
                 category=str(raw.get("category") or "bug")[:40],
+                source=source,
             )
         )
     return issues

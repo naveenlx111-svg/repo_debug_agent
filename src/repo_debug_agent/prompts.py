@@ -45,24 +45,27 @@ If there are no real bugs, answer {{"issues": []}}.
 
 
 # Decoding constraint matching the shape asked for above, fields in the same order (reasoning
-# before verdict). Supported servers enforce it; others fall back to plain JSON mode.
+# before verdict). Supported servers enforce it; others fall back to plain JSON mode. The
+# length limits stop a model that starts repeating itself inside a field: the field is closed
+# and the finding still completes, instead of the reply running into the token limit.
 REVIEW_SCHEMA: dict = {
     "type": "object",
     "properties": {
         "issues": {
             "type": "array",
+            "maxItems": 8,
             "items": {
                 "type": "object",
                 "properties": {
                     "line": {"type": "integer"},
-                    "symbol": {"type": "string"},
-                    "suspicion": {"type": "string"},
-                    "trace": {"type": "string"},
+                    "symbol": {"type": "string", "maxLength": 150},
+                    "suspicion": {"type": "string", "maxLength": 300},
+                    "trace": {"type": "string", "maxLength": 700},
                     "confirmed": {"type": "boolean"},
                     "severity": {"enum": ["critical", "high", "medium", "low"]},
                     "confidence": {"type": "number"},
-                    "category": {"type": "string"},
-                    "description": {"type": "string"},
+                    "category": {"type": "string", "maxLength": 40},
+                    "description": {"type": "string", "maxLength": 500},
                 },
                 "required": [
                     "line",
@@ -80,6 +83,24 @@ REVIEW_SCHEMA: dict = {
     },
     "required": ["issues"],
 }
+
+
+def review_followup(already_reported: list[str]) -> str:
+    """Extra instructions for a follow-up review pass: look for what the first pass missed."""
+    if already_reported:
+        reported = "A first review of this code already reported:\n" + "\n".join(
+            f"- {r[:220]}" for r in already_reported
+        )
+    else:
+        reported = "A first review of this code reported no bugs."
+    return (
+        f"{reported}\n\n"
+        "Review it again, function by function, for real bugs that review MISSED. Do not repeat "
+        "the findings above. Check especially what first reviews tend to skip: empty strings and "
+        "collections, None, zero and negative numbers, values read from configuration or the "
+        "environment, boundaries and off-by-one errors, and error-handling paths. Most code has no "
+        'further bugs; if you find none, answer {"issues": []}.'
+    )
 
 
 def review_prompt(
@@ -180,8 +201,8 @@ def fix_prompt(
         f"```{fence}\n<the complete corrected replacement for {target}: {whole}not a diff, "
         "not only the changed lines, and nothing else>\n```\n"
         "EXPLANATION: <one sentence: what was wrong and how you fixed it>\n\n"
-        "Code outside the block you return cannot be changed, so don't rely on edits elsewhere."
-        + import_note
+        "Keep the ANALYSIS short and put no commentary inside the code. Code outside the block "
+        "you return cannot be changed, so don't rely on edits elsewhere." + import_note
     )
     return "\n\n".join(sections)
 
@@ -247,7 +268,8 @@ def repro_prompt(
         "callers and tests), not what you would prefer.\n"
         "- While the bug exists the script must fail (AssertionError or the reported exception); "
         "once the bug is fixed it must pass.\n"
-        "- No test framework, no network, no files outside a temporary directory, under 30 lines.\n\n"
+        "- No test framework, no network, no files outside a temporary directory, under 30 lines, "
+        "and no reasoning written into comments.\n\n"
         "If the problem can't be shown this way (a leak, a race, or only with impossible inputs) "
         "or you conclude the code is actually correct, reply with one line: "
         "NOT_REPRODUCIBLE: <reason>\n"
@@ -311,4 +333,20 @@ def vet_prompt(issue: Issue, chunk: Chunk, script: str, output: str, related: st
         "EXPECTATION: correct or wrong - does the script assert what the code is meant to do "
         "(its name, docstring, callers, tests), not a preference? One sentence.\n"
         "VERDICT: VALID if the input is realistic and the expectation correct, otherwise INVALID"
+    )
+
+
+def feedback_rambling() -> str:
+    return (
+        "Your answer got stuck repeating itself and was cut off before it was complete. Start "
+        "again in the required structure: at most 4 sentences of ANALYSIS, the VERDICT, then the "
+        "code with no commentary inside it."
+    )
+
+
+def feedback_rambling_script() -> str:
+    return (
+        "Your answer got stuck repeating itself and was cut off. Reply with only the script, in "
+        "one ```python block, under 30 lines, with no reasoning in comments. Or NOT_REPRODUCIBLE: "
+        "<reason>."
     )

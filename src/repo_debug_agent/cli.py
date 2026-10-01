@@ -92,6 +92,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     g.add_argument("--max-attempts", type=int, default=3, help="fix attempts per issue (default 3)")
     g.add_argument(
+        "--review-passes",
+        type=int,
+        default=2,
+        help="review each file N times; later passes look for bugs earlier ones missed "
+        "(default 2; 1 is faster but finds fewer bugs)",
+    )
+    g.add_argument(
         "--workers",
         type=int,
         help="parallel file reviews (default: 4 for groq, 1 for local servers)",
@@ -145,6 +152,7 @@ def settings_from_args(args: argparse.Namespace) -> AgentSettings:
         max_issues=args.max_issues,
         min_confidence=args.min_confidence,
         max_attempts=args.max_attempts,
+        review_passes=args.review_passes,
         repro=not args.no_repro,
         python=args.python,
         workers=args.workers,

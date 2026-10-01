@@ -254,3 +254,39 @@ def test_mock_based_scripts_are_never_accepted_as_reproductions(repo, make_setti
     assert result.repro_status == "unavailable" and result.verified_by == "syntax"
     feedback = next(c for c in llm.calls if len(c) == 4 and is_repro_request(c))[3]["content"]
     assert "mocks" in feedback
+
+
+def test_runaway_repro_reply_with_complete_script_is_used(repo, make_settings):
+    from repo_debug_agent.llm import LLMTruncatedError
+
+    partial = script("from calc import average\nassert average([]) == 0") + "\nWait, maybe" * 50
+
+    def respond(messages, json_mode):
+        if json_mode:
+            return review_reply(AVERAGE)
+        if is_vet_request(messages):
+            return VALID
+        if is_repro_request(messages):
+            raise LLMTruncatedError("cut off", partial=partial)
+        return fix_reply(GOOD_FIX)
+
+    report = run(settings(make_settings, repo), llm=ScriptedLLM(respond), ui=UI.silent())
+    assert report.results[0].repro_status == "reproduced"
+
+
+def test_repro_reply_that_never_produces_a_script_is_unavailable(repo, make_settings):
+    from repo_debug_agent.llm import LLMTruncatedError
+
+    seen = []
+
+    def respond(messages, json_mode):
+        if json_mode:
+            return review_reply(AVERAGE)
+        if is_repro_request(messages):
+            seen.append(messages)
+            raise LLMTruncatedError("cut off", partial="# Wait, maybe... " * 300)
+        return fix_reply(GOOD_FIX)
+
+    report = run(settings(make_settings, repo), llm=ScriptedLLM(respond), ui=UI.silent())
+    assert report.results[0].repro_status == "unavailable"
+    assert len(seen) == 2 and "stuck repeating itself" in seen[1][3]["content"]

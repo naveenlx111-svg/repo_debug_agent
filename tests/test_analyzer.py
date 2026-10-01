@@ -250,3 +250,31 @@ def test_reviews_request_schema_constrained_output():
     assert llm.options == [{"json_mode": True, "json_schema": prompts.REVIEW_SCHEMA}]
     required = prompts.REVIEW_SCHEMA["properties"]["issues"]["items"]["required"]
     assert required.index("trace") < required.index("confirmed")  # reasoning before verdict
+
+
+def test_review_schema_bounds_runaway_fields():
+    from repo_debug_agent import prompts
+
+    issues = prompts.REVIEW_SCHEMA["properties"]["issues"]
+    fields = issues["items"]["properties"]
+    assert issues["maxItems"] <= 10
+    assert all("maxLength" in fields[f] for f in ("suspicion", "trace", "description"))
+
+
+def test_second_pass_looks_for_what_the_first_missed():
+    src = "def f(x):\n    return x[0]\n\n\ndef g(x):\n    return 1 / x\n"
+    sf = SourceFile(path=None, rel="m.py", language=BY_NAME["python"], is_test=False)
+    first = {"line": 2, "symbol": "f", "confidence": 0.9, "description": "IndexError on []"}
+    second = {"line": 6, "symbol": "g", "confidence": 0.9, "description": "ZeroDivisionError on 0"}
+
+    def respond(messages, json_mode):
+        followup = "A first review of this code already reported" in messages[1]["content"]
+        return review_reply(second if followup else first)
+
+    llm = ScriptedLLM(respond)
+    review = Analyzer(llm, "fake", 400, passes=2).review(
+        sf, src, chunk_source("m.py", src, sf.language)
+    )
+    assert len(llm.calls) == 2
+    assert "line 2 (f): IndexError on []" in llm.calls[1][1]["content"]
+    assert [(i.symbol, i.source) for i in review.issues] == [("f", "llm"), ("g", "llm-pass2")]

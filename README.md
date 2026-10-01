@@ -33,8 +33,14 @@ scan → index → baseline tests → review → reproduce → fix ⟲ verify �
    Where the server supports it (llama.cpp does), output is constrained to a JSON schema,
    so an unescaped quote in a small model's reasoning can't derail the reply; this took
    well-formed replies on a problem prompt from 6/8 to 8/8, and made them 2.7x faster.
-   If a model still loops into the token limit, the complete findings it produced first
-   are kept. Reviews are cached, so re-runs only re-review changed code.
+   The schema also caps each field's length, so a model that starts repeating itself
+   inside its reasoning gets that field closed and still finishes the finding, instead of
+   running into the token limit. If a reply is cut off anyway, the complete findings it
+   produced first are kept. Reviews are cached, so re-runs only re-review changed code.
+   A **second review pass** sees what the first reported and looks specifically for bugs it
+   missed (empty values, None, zero, config/env values, boundaries, error paths). On the
+   sample repo without tests, it raised recall from 3–4 to 6–7 of 8 bugs in three runs with
+   no added false positives, and found the leaked file handle no earlier run had caught.
 6. **Reproduce** (Python). Before fixing, the model writes a small script that demonstrates
    the bug, using only inputs the real callers can produce (it is shown how the code is
    called) and no mocks (scripts that use them are rejected). The agent runs it against the
@@ -50,6 +56,9 @@ scan → index → baseline tests → review → reproduce → fix ⟲ verify �
    behaviour? A script that fails the check gets one rewrite; if the rewrite also fails it,
    the reproduction doesn't count as evidence. The bug isn't dismissed, because the check
    can be wrong too.
+   Token limits for fixes and reproduction scripts are sized to the code involved, so a
+   reply that starts looping is stopped in seconds. If it already contains complete code,
+   that code is used; otherwise the retry is told it got stuck repeating itself.
 7. **Fix loop.** For each issue, the model gets the function, the rest of the file, related
    code from the index and any failing tests. It must answer
    `ANALYSIS → VERDICT → code → EXPLANATION`, so it can also reject a false report. The new
@@ -136,6 +145,7 @@ git -C REPO apply debug_reports/<run>/fixes.patch   # ...or apply the patch your
 | `--min-confidence F` | 0.6 | skip findings the reviewer is less sure about |
 | `--max-issues N` | 20 | cap on fixes per run |
 | `--max-attempts N` | 3 | fix attempts per issue, each with feedback |
+| `--review-passes N` | 2 | the second pass looks for bugs the first missed; 1 is faster |
 | `--no-repro` | off | skip reproduce-before-fix (it runs model-written scripts) |
 | `--python PATH` | repo's `.venv`, else `python3` | interpreter for reproduction scripts |
 | `--include-tests` | off | also review/fix test files (off: tests are the spec) |
@@ -217,7 +227,10 @@ passed on the current code), 3 unverified suggestions, **0 applied edits**. One 
 suggestions would have changed correct logic, which the old behaviour would have applied.
 That run also shows the remaining weak spot: the reviewer didn't flag the real
 `LLM_TIMEOUT` bug at all (it made a different, invalid claim about the same function).
-Which bugs the review finds still varies from run to run with a small model.
+Which bugs the review finds still varies from run to run with a small model. The
+second review pass (now the default) helps on the sample repo, but on this code it didn't
+recover that bug in two runs; it added about 6 more candidates per run for the fix stage
+to sort out.
 
 ## Limitations
 

@@ -151,6 +151,7 @@ class AgentSettings:
     max_issues: int = 20
     min_confidence: float = 0.6
     review_max_lines: int = 400  # files longer than this are reviewed in windows
+    review_passes: int = 2  # follow-up passes look for bugs earlier passes missed
     max_file_bytes: int = 256_000
     workers: int | None = None  # None: the provider's default
 
@@ -178,6 +179,8 @@ class AgentSettings:
             raise ConfigError(f"repo path is not a directory: {self.repo}")
         if not 0.0 <= self.min_confidence <= 1.0:
             raise ConfigError("--min-confidence must be between 0 and 1")
+        if self.review_passes < 1:
+            raise ConfigError("--review-passes must be at least 1")
         if self.max_attempts < 1:
             raise ConfigError("--max-attempts must be at least 1")
         if self.workers is None:

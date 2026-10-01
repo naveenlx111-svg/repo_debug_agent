@@ -77,6 +77,7 @@ def make_settings(tmp_path):
             use_embeddings=False,
             repro=False,  # tests that want reproduction turn it on explicitly
             review_cache=False,  # likewise for the review cache
+            review_passes=1,  # and for follow-up review passes
             workers=1,
             index_dir=tmp_path / "index",
         )

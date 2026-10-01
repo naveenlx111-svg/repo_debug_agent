@@ -20,13 +20,20 @@ from enum import Enum
 from pathlib import Path
 
 from repo_debug_agent import prompts
-from repo_debug_agent.llm import ChatModel, LLMError, LLMUnavailableError, Message, pick_code_block
+from repo_debug_agent.llm import (
+    ChatModel,
+    LLMError,
+    LLMTruncatedError,
+    LLMUnavailableError,
+    Message,
+    pick_code_block,
+)
 from repo_debug_agent.models import Chunk, Issue
 from repo_debug_agent.validation import TestRun, run_tests
 from repo_debug_agent.workspace import Workspace
 
 REPRO_TIMEOUT = 30.0
-REPRO_MAX_TOKENS = 2048
+REPRO_MAX_TOKENS = 1024  # a script under 30 lines needs far less; a loop stops early
 VET_MAX_TOKENS = 512
 _VET_VERDICT = re.compile(r"VERDICT\W*\s*(INVALID|VALID)", re.IGNORECASE)
 _DECLINE = re.compile(r"^\W*NOT_REPRODUCIBLE\W*\s*(.*)", re.IGNORECASE | re.MULTILINE)
@@ -146,6 +153,20 @@ class Reproducer:
                 calls += 1
             except LLMUnavailableError:
                 raise
+            except LLMTruncatedError as e:
+                calls += 1
+                if pick_code_block(e.partial) is not None:
+                    reply = e.partial  # the script was complete; only the chatter after it ran on
+                elif attempt == 1:
+                    clipped = e.partial[:600] + "\n[... cut off: it kept repeating]"
+                    messages = messages[:2] + [
+                        {"role": "assistant", "content": clipped},
+                        {"role": "user", "content": prompts.feedback_rambling_script()},
+                    ]
+                    continue
+                else:
+                    detail = "the reproduction script kept growing until it was cut off"
+                    return Reproduction(ReproStatus.UNAVAILABLE, detail=detail, calls=calls)
             except LLMError as e:
                 return Reproduction(ReproStatus.UNAVAILABLE, detail=f"LLM error: {e}", calls=calls)
 

@@ -112,3 +112,12 @@ def test_file_excerpt_marks_the_target_and_windows_large_files():
     assert not whole
     assert "x0 = 0" in excerpt and "omitted" in excerpt and "x999 = 999" in excerpt
     assert "x500 = 500" not in excerpt
+
+
+def test_fix_token_budget_scales_with_the_code():
+    from repo_debug_agent.fixer import FIX_MAX_TOKENS, fix_max_tokens
+
+    small = chunk("Cart.total")
+    assert fix_max_tokens(small) < 1200  # a loop on a small function stops early
+    big = small.__class__(**{**small.__dict__, "code": "x = 1\n" * 3000})
+    assert fix_max_tokens(big) == FIX_MAX_TOKENS
