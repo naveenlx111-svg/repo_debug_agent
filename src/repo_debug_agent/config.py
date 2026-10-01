@@ -155,6 +155,9 @@ class AgentSettings:
     workers: int | None = None  # None: the provider's default
 
     # Fixing
+    # Keep fixes with no evidence the bug is real (syntax checks only) in the patch/--apply,
+    # instead of reporting them as suggestions.
+    keep_unverified: bool = False
     repro: bool = True  # reproduce Python bugs with a model-written script before fixing
     python: str | None = None  # interpreter for reproduction scripts (None: auto-detect)
     max_attempts: int = 3

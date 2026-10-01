@@ -27,6 +27,8 @@ from repo_debug_agent.workspace import Workspace
 
 REPRO_TIMEOUT = 30.0
 REPRO_MAX_TOKENS = 2048
+VET_MAX_TOKENS = 512
+_VET_VERDICT = re.compile(r"VERDICT\W*\s*(INVALID|VALID)", re.IGNORECASE)
 _DECLINE = re.compile(r"^\W*NOT_REPRODUCIBLE\W*\s*(.*)", re.IGNORECASE | re.MULTILINE)
 
 
@@ -34,6 +36,9 @@ class ReproStatus(str, Enum):
     REPRODUCED = "reproduced"  # fails now, in the target code or on an assertion
     NOT_REPRODUCED = "not_reproduced"  # the script passed: the report looks wrong
     UNAVAILABLE = "unavailable"  # declined (not scriptable) or the script was broken
+    # The script failed, but a check found its input or expectation unrealistic. Not evidence
+    # either way: the bug isn't dismissed, but a fix for it can't count as verified.
+    REJECTED = "rejected"
 
 
 @dataclass
@@ -159,20 +164,27 @@ class Reproducer:
                 run = self.run(script, chunk.file)
                 outcome = classify(run, chunk.file)
                 if outcome == "relevant":
-                    return Reproduction(
-                        ReproStatus.REPRODUCED,
-                        script,
-                        run.excerpt(2000),
-                        "fails as reported",
-                        calls,
+                    valid, why = self.vet(issue, chunk, script, run.excerpt(1500), related)
+                    calls += 1
+                    if valid:
+                        return Reproduction(
+                            ReproStatus.REPRODUCED, script, run.excerpt(2000), why, calls
+                        )
+                    outcome, rejected_output = "rejected", run.excerpt(2000)
+                    feedback = prompts.repro_feedback_rejected(why)
+                else:
+                    feedback = (
+                        prompts.repro_feedback_passed()
+                        if outcome == "pass"
+                        else prompts.repro_feedback_broken(run.excerpt(1500))
                     )
-                feedback = (
-                    prompts.repro_feedback_passed()
-                    if outcome == "pass"
-                    else prompts.repro_feedback_broken(run.excerpt(1500))
-                )
 
             if attempt == 2:
+                if outcome == "rejected":
+                    detail = f"the reproduction script was rejected: {why}"
+                    return Reproduction(
+                        ReproStatus.REJECTED, script, rejected_output, detail, calls
+                    )
                 if outcome == "pass":
                     detail = "the reproduction script passed against the current code"
                     return Reproduction(
@@ -190,3 +202,26 @@ class Reproducer:
                 {"role": "user", "content": feedback},
             ]
         raise AssertionError("unreachable")
+
+    def vet(
+        self, issue: Issue, chunk: Chunk, script: str, output: str, related: str
+    ) -> tuple[bool, str]:
+        """A second opinion, from a fresh context: does this failing script show a real bug,
+        or one it manufactured (impossible input, wrong expectation)? Returns (valid, why)."""
+        messages: list[Message] = [
+            {"role": "system", "content": prompts.VET_SYSTEM},
+            {"role": "user", "content": prompts.vet_prompt(issue, chunk, script, output, related)},
+        ]
+        try:
+            reply = self.llm.complete(messages, model=self.model, max_tokens=VET_MAX_TOKENS)
+        except LLMUnavailableError:
+            raise
+        except LLMError as e:
+            return True, f"fails as reported (the script check itself failed: {e})"
+        verdict = _VET_VERDICT.search(reply)
+        reasons = " ".join(
+            m.group(0).strip() for m in re.finditer(r"^\W*(INPUT|EXPECTATION)\W.*$", reply, re.M)
+        )
+        if verdict and verdict.group(1).upper() == "INVALID":
+            return False, reasons or "the check judged the input or expectation unrealistic"
+        return True, "fails as reported" + (f" ({reasons})" if reasons else "")

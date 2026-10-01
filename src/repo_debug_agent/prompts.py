@@ -44,6 +44,44 @@ If there are no real bugs, answer {{"issues": []}}.
 """
 
 
+# Decoding constraint matching the shape asked for above, fields in the same order (reasoning
+# before verdict). Supported servers enforce it; others fall back to plain JSON mode.
+REVIEW_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "line": {"type": "integer"},
+                    "symbol": {"type": "string"},
+                    "suspicion": {"type": "string"},
+                    "trace": {"type": "string"},
+                    "confirmed": {"type": "boolean"},
+                    "severity": {"enum": ["critical", "high", "medium", "low"]},
+                    "confidence": {"type": "number"},
+                    "category": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": [
+                    "line",
+                    "symbol",
+                    "suspicion",
+                    "trace",
+                    "confirmed",
+                    "severity",
+                    "confidence",
+                    "category",
+                    "description",
+                ],
+            },
+        }
+    },
+    "required": ["issues"],
+}
+
+
 def review_prompt(
     rel: str,
     language: str,
@@ -237,4 +275,40 @@ def repro_feedback_mocks() -> str:
         "Your script uses mocks or monkeypatching. A mock can make any code fail, so it "
         "demonstrates the mock, not a bug. Rewrite it to run the real code with inputs its real "
         "callers could pass, or reply NOT_REPRODUCIBLE: <reason> if that can't show the bug."
+    )
+
+
+def repro_feedback_rejected(why: str) -> str:
+    return (
+        "A check of your script found a problem with it:\n"
+        f"{why}\n"
+        "Rewrite it with inputs the real program can produce and an assertion that matches how "
+        "the code is meant to behave, or reply NOT_REPRODUCIBLE: <reason> if the bug can't be "
+        "shown that way."
+    )
+
+
+# --------------------------------------------------------------------------- reproduction check
+
+VET_SYSTEM = (
+    "You are a skeptical senior engineer checking another engineer's bug reproduction. Scripts "
+    "often manufacture failures by passing inputs the real program never produces, or by "
+    "asserting what the author wanted instead of what the code is meant to do."
+)
+
+
+def vet_prompt(issue: Issue, chunk: Chunk, script: str, output: str, related: str) -> str:
+    usage = related or "(no other code in the repository calls it)"
+    return (
+        f"Bug report for `{chunk.file}`: {issue.description}\n\n"
+        f"## The code\n```python\n{chunk.code}\n```\n\n"
+        f"## How the rest of the repository uses it\n{usage}\n\n"
+        f"## The reproduction script\n```python\n{script.rstrip()}\n```\n"
+        f"It fails against the current code:\n```\n{output}\n```\n\n"
+        "Answer in exactly this format:\n"
+        "INPUT: realistic or unrealistic - could the real program pass these inputs, the way the "
+        "callers above do or its documented interface allows? One sentence.\n"
+        "EXPECTATION: correct or wrong - does the script assert what the code is meant to do "
+        "(its name, docstring, callers, tests), not a preference? One sentence.\n"
+        "VERDICT: VALID if the input is realistic and the expectation correct, otherwise INVALID"
     )

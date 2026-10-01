@@ -189,6 +189,7 @@ def run(settings: AgentSettings, llm: ChatModel | None = None, ui: UI | None = N
                 settings.max_attempts,
                 settings.llm.temperature,
                 reproducer,
+                settings.keep_unverified,
             )
             for n, issue in enumerate(selected):
                 ui.fix_started(issue)
@@ -265,6 +266,7 @@ def _finish(
     report.duration_s = time.monotonic() - started
     out_dir = settings.out_dir / datetime.now().strftime("%Y%m%d-%H%M%S")
     transcript = usage_from.records if isinstance(usage_from, RecordingLLM) else None
-    paths = write_outputs(report, patch, out_dir, transcript)
+    suggestions = "".join(r.diff for r in report.results if r.status == FixStatus.SUGGESTED)
+    paths = write_outputs(report, patch, out_dir, transcript, suggestions)
     ui.summary(report, paths, applied=settings.apply)
     return report

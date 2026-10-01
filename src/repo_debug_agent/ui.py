@@ -22,6 +22,7 @@ _STATUS_STYLE = {
     FixStatus.FAILED: "red",
     FixStatus.SKIPPED: "dim",
     FixStatus.REPORTED: "cyan",
+    FixStatus.SUGGESTED: "blue",
 }
 _SEVERITY_STYLE = {"critical": "bold red", "high": "red", "medium": "yellow", "low": "dim"}
 
@@ -118,6 +119,8 @@ class UI:
             self.detail(
                 f"verified by: {VERIFIED_LABEL.get(result.verified_by, result.verified_by)}"
             )
+        elif result.status == FixStatus.SUGGESTED:
+            self.detail("not applied: nothing showed the bug is real (see suggestions.patch)")
 
     def summary(self, report: RunReport, paths: dict[str, Path], applied: bool) -> None:
         self._end_stage()
@@ -151,3 +154,8 @@ class UI:
                     "[dim]The repo was not modified. Re-run with --apply, or: "
                     f"git -C {escape(report.repo)} apply {escape(str(paths['patch']))}[/]"
                 )
+        if "suggestions" in paths:
+            self.console.print(
+                f"Suggestions: {escape(str(paths['suggestions']))} "
+                "[dim](unverified: nothing showed these bugs are real; review before applying)[/]"
+            )

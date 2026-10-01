@@ -3,7 +3,14 @@
 import sys
 
 import pytest
-from conftest import ScriptedLLM, fix_reply, is_repro_request, review_reply, write_tree
+from conftest import (
+    ScriptedLLM,
+    fix_reply,
+    is_repro_request,
+    is_vet_request,
+    review_reply,
+    write_tree,
+)
 
 from repo_debug_agent.models import Chunk, FixStatus
 from repo_debug_agent.pipeline import run
@@ -81,13 +88,23 @@ def repo(tmp_path):
     return write_tree(tmp_path / "repo", {"calc.py": CALC})
 
 
-def scripted(issues, repros, fixes):
-    """Review -> `issues`; repro requests -> `repros` in order; fix requests -> `fixes` in order."""
+VALID = "INPUT: realistic\nEXPECTATION: correct\nVERDICT: VALID"
+INVALID = (
+    "INPUT: unrealistic - no caller passes an empty tuple.\nEXPECTATION: correct\nVERDICT: INVALID"
+)
+
+
+def scripted(issues, repros, fixes, vets=None):
+    """Review -> `issues`; repro requests -> `repros`; script checks -> `vets` (default: all
+    VALID); fix requests -> `fixes`. Each list is consumed in order."""
     repros, fixes = iter(repros), iter(fixes)
+    vets = iter(vets) if vets is not None else None
 
     def respond(messages, json_mode):
         if json_mode:
             return review_reply(*issues)
+        if is_vet_request(messages):
+            return next(vets) if vets is not None else VALID
         if is_repro_request(messages):
             return next(repros)
         return next(fixes)
@@ -110,7 +127,9 @@ def test_reproduced_bug_is_fixed_and_verified_by_the_script(repo, make_settings)
     assert result.status == FixStatus.FIXED
     assert result.verified_by == "repro" and result.repro_status == "reproduced"
     fix_prompt = next(
-        c for c in llm.calls if "Report:" in c[1]["content"] and not is_repro_request(c)
+        c
+        for c in llm.calls
+        if "Report:" in c[1]["content"] and not is_repro_request(c) and not is_vet_request(c)
     )[1]["content"]
     assert "## Reproduction attempt" in fix_prompt and "ZeroDivisionError" in fix_prompt
     assert "real callers" in fix_prompt  # the fixer is asked to vet the script, not trust it
@@ -160,12 +179,46 @@ def test_fix_that_leaves_the_script_failing_is_rejected(repo, make_settings):
         ["NOT_REPRODUCIBLE: this is a resource leak"],  # can't be scripted
     ],
 )
-def test_without_a_usable_script_fixing_proceeds_as_before(repo, make_settings, repros):
+def test_without_a_usable_script_the_fix_is_only_a_suggestion(repo, make_settings, repros):
     llm = scripted([AVERAGE], repros, [fix_reply(GOOD_FIX)])
     report = run(settings(make_settings, repo), llm=llm, ui=UI.silent())
     [result] = report.results
-    assert result.status == FixStatus.FIXED
+    assert result.status == FixStatus.SUGGESTED
     assert result.repro_status == "unavailable" and result.verified_by == "syntax"
+
+
+def test_a_script_the_check_rejects_is_retried_with_the_reason(repo, make_settings):
+    llm = scripted(
+        [AVERAGE],
+        [
+            script("from calc import average\naverage(None)"),
+            script("from calc import average\nassert average([]) == 0"),
+        ],
+        [fix_reply(GOOD_FIX)],
+        vets=[INVALID, VALID],
+    )
+    report = run(settings(make_settings, repo), llm=llm, ui=UI.silent())
+    [result] = report.results
+    assert result.repro_status == "reproduced" and result.verified_by == "repro"
+    retry = next(c for c in llm.calls if is_repro_request(c) and len(c) == 4)
+    assert "no caller passes an empty tuple" in retry[3]["content"]
+
+
+def test_a_script_rejected_twice_is_not_evidence(repo, make_settings):
+    manufactured = script("from calc import average\naverage(None)")
+    llm = scripted(
+        [AVERAGE], [manufactured, manufactured], [fix_reply(GOOD_FIX)], vets=[INVALID, INVALID]
+    )
+    report = run(settings(make_settings, repo), llm=llm, ui=UI.silent())
+    [result] = report.results
+    assert result.repro_status == "rejected"  # not dismissed: the check can be wrong too
+    assert result.status == FixStatus.SUGGESTED and result.verified_by == "syntax"
+    fix_prompt = next(
+        c
+        for c in llm.calls
+        if "Report:" in c[1]["content"] and not is_repro_request(c) and not is_vet_request(c)
+    )
+    assert "## Reproduction attempt" not in fix_prompt[1]["content"]
 
 
 def test_a_misbehaving_script_cannot_corrupt_the_repo_or_the_sandbox(repo, make_settings):

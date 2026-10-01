@@ -30,8 +30,11 @@ scan → index → baseline tests → review → reproduce → fix ⟲ verify �
    review of every non-test file. The model has to *trace* each suspicion on a concrete
    input before confirming it, which cuts false positives. Findings are mapped to the exact
    function they live in, and several findings in one function are merged into one fix.
-   If a small model starts looping and hits the token limit, the complete findings it
-   produced before that are kept. Reviews are cached, so re-runs only re-review changed code.
+   Where the server supports it (llama.cpp does), output is constrained to a JSON schema,
+   so an unescaped quote in a small model's reasoning can't derail the reply; this took
+   well-formed replies on a problem prompt from 6/8 to 8/8, and made them 2.7x faster.
+   If a model still loops into the token limit, the complete findings it produced first
+   are kept. Reviews are cached, so re-runs only re-review changed code.
 6. **Reproduce** (Python). Before fixing, the model writes a small script that demonstrates
    the bug, using only inputs the real callers can produce (it is shown how the code is
    called) and no mocks (scripts that use them are rejected). The agent runs it against the
@@ -42,8 +45,11 @@ scan → index → baseline tests → review → reproduce → fix ⟲ verify �
      prompt, and a fix is accepted only once the script passes;
    - it **can't run**, or the bug can't be scripted (leaks, races): the usual checks apply.
 
-   Treat a script as a claim, not proof: a small model can assert the wrong expectation.
-   That's why the script is included in the report, where it's the quickest thing to check.
+   A failing script is then checked by a separate, skeptical call that sees the real callers:
+   could the program actually pass that input, and does the assertion match the intended
+   behaviour? A script that fails the check gets one rewrite; if the rewrite also fails it,
+   the reproduction doesn't count as evidence. The bug isn't dismissed, because the check
+   can be wrong too.
 7. **Fix loop.** For each issue, the model gets the function, the rest of the file, related
    code from the index and any failing tests. It must answer
    `ANALYSIS → VERDICT → code → EXPLANATION`, so it can also reject a false report. The new
@@ -55,7 +61,14 @@ scan → index → baseline tests → review → reproduce → fix ⟲ verify �
 
    On failure the model sees *why* (the syntax error, new undefined name, or test output)
    and tries again. It doesn't just get the same question repeated.
-8. **Report.** `report.md` (human), `report.json` (machine), `fixes.patch` (`git apply`-able)
+   **No evidence, no edit.** A fix is only *applied* (kept for later fixes, written to
+   `fixes.patch`, used by `--apply`) when something shows the bug was real: the test suite
+   improved, a checked reproduction script failed before and passes after, or a static
+   finding (e.g. an undefined name) went away. A fix that only passes syntax checks is a
+   **suggestion**: it's in the report and `suggestions.patch`, but never applied.
+   `--keep-unverified` turns suggestions back into fixes.
+8. **Report.** `report.md` (human), `report.json` (machine), `fixes.patch` (verified fixes,
+   `git apply`-able), `suggestions.patch` (unverified)
    and `transcript.jsonl` (every prompt and reply, for debugging).
 
 ## Install
@@ -117,7 +130,8 @@ git -C REPO apply debug_reports/<run>/fixes.patch   # ...or apply the patch your
 | `--provider {groq,local,ollama}` | groq if `GROQ_API_KEY` is set, else local | |
 | `--base-url`, `--model`, `--triage-model`, `--fix-model` | from provider | any OpenAI-compatible endpoint |
 | `--test-cmd CMD` | none | run in a sandbox copy; strongly recommended |
-| `--apply` | off | write fixes into the repo (refuses files you edited during the run) |
+| `--apply` | off | write verified fixes into the repo (refuses files you edited during the run) |
+| `--keep-unverified` | off | treat syntax-checked-only fixes as fixes, not suggestions |
 | `--analyze-only` | off | report issues without fixing |
 | `--min-confidence F` | 0.6 | skip findings the reviewer is less sure about |
 | `--max-issues N` | 20 | cap on fixes per run |
@@ -151,10 +165,10 @@ See `.env.example`.
   weakening them.
 - `--apply` writes only files whose on-disk content still matches what the run started
   from. Line endings (LF/CRLF) are preserved.
-- Every accepted fix records how it was verified: `tests` (the suite improved),
-  `repro` (the reproduction script failed before and passes after), `no-regressions`
-  (tests ran, but none covered the bug), `syntax`, or `none`
-  (no checker for that language). **Review anything not verified by tests.**
+- Every fix records how it was verified. `tests` (the suite improved), `repro` (a checked
+  reproduction script failed before and passes after) and `static` (the static finding is
+  gone) count as evidence; `no-regressions` (tests ran, none covered the bug), `syntax` and
+  `none` don't, so those fixes are suggestions. **Review anything not verified by tests.**
 
 ## Results
 
@@ -173,36 +187,46 @@ repo-debug-agent examples/sample_repo --provider local --test-cmd "python -m pyt
 | | |
 | --- | --- |
 | Bugs found | 7 / 8 (missed: the unclosed file in `word_count`) |
-| Fixed | 7 / 7, first attempt each, minimal one- or two-line changes; 6 of 7 also reproduced by a script |
-| False reports | 1 (`Cart.add`, confused by cascading test failures), dismissed by the fixer |
+| False reports | 0 |
+| Applied fixes | 6, each on the first attempt, each reproduced by a script *and* verified by the test suite |
+| Suggestions | 1: `cartTotal` (JavaScript) is a real bug, but no test covers it and reproduction is Python-only, so it isn't applied |
 | Tests | 8 failing → all passing |
-| Time | ~3 minutes, 19 LLM calls |
+| Time | 3.3 min, 23 LLM calls; a re-run reuses every review from cache and takes 2 min |
 
 ### Real code, no tests (the hard case)
 
-The agent's own source (22 files), with no test command, so reproduction and syntax checks
-are the only safeguards. Two runs from the *same* cached findings, with reproduction off
-and on:
+The agent's own source (22 files), with no test command, so reproduction and static
+checks are the only evidence. Three runs from the *same* cached findings (11 selected):
+without reproduction, with it, and with the current evidence policy (fixes without
+evidence become suggestions; reproduction scripts are checked against the real callers):
 
-| | reproduction off | reproduction on |
-| --- | --- | --- |
-| Real bug found and fixed (empty `LLM_TIMEOUT` rejected) | yes, syntax-checked | yes, **verified by a script** |
-| Unneeded edits to correct code | 5 | 4 |
-| Edits that broke correct logic | 1 | **0** |
-| False reports correctly dismissed | 2 | **5** |
-| Fix stage | 17 LLM calls, 24 min | 24 calls (13 for reproduction), 20 min |
+| | no reproduction | reproduction | **+ evidence policy** |
+| --- | --- | --- | --- |
+| Real bug (empty `LLM_TIMEOUT` rejected) fixed | yes, syntax-checked only | yes, script-verified | yes, script-verified |
+| **Unneeded edits in the applied patch** | 5 | 4 | **0** |
+| Edits that broke correct logic, applied | 1 | 0 | 0 |
+| Unverified fixes held back as suggestions | – | – | 3 |
+| False reports dismissed | 2 | 5 | 5 |
 
-Across two rounds: without reproduction 16 of 29 attempted issues ended in unneeded
-edits (2 harmful); with it, 10 of 26 (none harmful).
+So on code without tests, the patch now contains only what was shown to be a real bug;
+the rest is clearly marked as unverified suggestions.
+
+A further run of the complete current system (schema-constrained reviews, fresh findings)
+on the same code: 17 suspected issues, 13 dismissed (7 because the reproduction script
+passed on the current code), 3 unverified suggestions, **0 applied edits**. One of the
+suggestions would have changed correct logic, which the old behaviour would have applied.
+That run also shows the remaining weak spot: the reviewer didn't flag the real
+`LLM_TIMEOUT` bug at all (it made a different, invalid claim about the same function).
+Which bugs the review finds still varies from run to run with a small model.
 
 ## Limitations
 
-- **Small models over-report on real code.** On production-quality code a 7–9B model
-  flags plausible-sounding non-bugs. The reviewer's self-check, reproduction and the
-  fixer's verdict catch many, and reproduction stops the harmful ones, but defensive
-  noise still gets through: extra guards for conditions that can't happen, mostly in code
-  too entangled to script. A test suite is what makes the output trustworthy. Without
-  one, treat the patch as suggestions, and consider a larger `--fix-model`.
+- **Small models over-report on real code, and their findings vary.** On production-quality
+  code a 7–9B model flags plausible-sounding non-bugs. Most are dismissed, and the rest end
+  up as suggestions rather than applied edits, but the suggestions list still needs a human
+  look. Which real bugs get flagged also varies between runs; a larger `--triage-model` or
+  a second run helps. A test suite is what turns real bugs into verified fixes; without one,
+  only reproducible Python bugs and static findings can be verified.
 - A reproduction script is the model's claim, not proof. It can use an input the real
   callers never produce, or assert the wrong expectation. The script is in the report
   so you can check it quickly.
@@ -243,6 +267,6 @@ examples/sample_repo/
 
 ```bash
 pip install -e ".[rag,dev]"
-pytest            # ~130 tests, offline, a few seconds
+pytest            # ~140 tests, offline, a few seconds
 ruff check src tests && ruff format src tests
 ```

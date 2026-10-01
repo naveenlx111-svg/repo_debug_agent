@@ -57,7 +57,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     g = p.add_argument_group("output")
-    g.add_argument("--apply", action="store_true", help="write accepted fixes into the repo")
+    g.add_argument(
+        "--apply",
+        action="store_true",
+        help="write verified fixes into the repo (suggestions are never applied)",
+    )
+    g.add_argument(
+        "--keep-unverified",
+        action="store_true",
+        help="treat fixes that only passed syntax checks as fixes, not suggestions "
+        "(they go into fixes.patch and --apply)",
+    )
     g.add_argument("--analyze-only", action="store_true", help="report issues without fixing")
     g.add_argument(
         "--out",
@@ -128,6 +138,7 @@ def settings_from_args(args: argparse.Namespace) -> AgentSettings:
         test_cmd=args.test_cmd,
         test_timeout=args.test_timeout,
         apply=args.apply,
+        keep_unverified=args.keep_unverified,
         analyze_only=args.analyze_only,
         keep_sandbox=args.keep_sandbox,
         include_tests=args.include_tests,

@@ -55,6 +55,7 @@ class ChatModel(Protocol):
         max_tokens: int = 2048,
         temperature: float | None = None,
         json_mode: bool = False,
+        json_schema: dict[str, Any] | None = None,
     ) -> str: ...
 
 
@@ -67,6 +68,7 @@ class OpenAICompatibleLLM:
         self.usage = Usage()
         self._lock = threading.Lock()
         self._json_mode_supported = True
+        self._schema_supported = True
         self._client = openai.OpenAI(
             base_url=settings.base_url,
             api_key=settings.api_key or "not-needed",
@@ -90,7 +92,10 @@ class OpenAICompatibleLLM:
         max_tokens: int = 2048,
         temperature: float | None = None,
         json_mode: bool = False,
+        json_schema: dict[str, Any] | None = None,
     ) -> str:
+        """`json_schema` constrains decoding to that exact shape where the server supports
+        it (llama.cpp does), falling back to plain JSON mode, then to prompt-only JSON."""
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -99,18 +104,38 @@ class OpenAICompatibleLLM:
         }
         if self.settings.extra_body:
             kwargs["extra_body"] = self.settings.extra_body
-        use_json = json_mode and self._json_mode_supported
-        if use_json:
-            kwargs["response_format"] = {"type": "json_object"}
+        response_format: dict[str, Any] | None = None
+        if json_schema is not None and self._schema_supported:
+            # A schema keeps the output well-formed even when a small model writes an
+            # unescaped quote inside a string: the grammar forces the next key instead of
+            # letting the reply derail.
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {"name": "reply", "schema": json_schema},
+            }
+        elif (json_mode or json_schema is not None) and self._json_mode_supported:
+            response_format = {"type": "json_object"}
+        if response_format:
+            kwargs["response_format"] = response_format
 
         try:
             response = self._client.chat.completions.create(**kwargs)
         except self._openai.BadRequestError as e:
-            if use_json and ("response_format" in str(e) or "json" in str(e).lower()):
-                log.warning("endpoint rejected JSON mode; falling back to prompt-only JSON (%s)", e)
-                self._json_mode_supported = False
+            text = str(e).lower()
+            if response_format and any(w in text for w in ("response_format", "json", "schema")):
+                if response_format["type"] == "json_schema":
+                    log.warning("endpoint rejected JSON-schema output; using JSON mode (%s)", e)
+                    self._schema_supported = False
+                else:
+                    log.warning("endpoint rejected JSON mode; using prompt-only JSON (%s)", e)
+                    self._json_mode_supported = False
                 return self.complete(
-                    messages, model=model, max_tokens=max_tokens, temperature=temperature
+                    messages,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    json_mode=json_mode,
+                    json_schema=json_schema,
                 )
             raise LLMError(f"request rejected: {e}") from e
         except self._openai.APITimeoutError as e:

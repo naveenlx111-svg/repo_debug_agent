@@ -32,6 +32,8 @@ log = logging.getLogger(__name__)
 REVIEW_MAX_TOKENS = 4096
 STATIC_CONFIDENCE = 0.95
 MIN_SPLIT_LINES = 20
+# Part of the review cache key: bump when REVIEW_SCHEMA changes shape.
+REVIEW_SCHEMA_ID = "review-v1"
 
 
 @dataclass
@@ -101,7 +103,11 @@ class Analyzer:
             {"role": "user", "content": prompt},
         ]
         max_tokens = review_max_tokens(end - start + 1)
-        key = self.cache.key(self.model, messages, max_tokens=max_tokens) if self.cache else ""
+        key = (
+            self.cache.key(self.model, messages, max_tokens=max_tokens, schema=REVIEW_SCHEMA_ID)
+            if self.cache
+            else ""
+        )
         cached = self.cache.get(key) if self.cache else None
         try:
             if cached is not None:
@@ -109,7 +115,11 @@ class Analyzer:
             else:
                 try:
                     reply = self.llm.complete(
-                        messages, model=self.model, max_tokens=max_tokens, json_mode=True
+                        messages,
+                        model=self.model,
+                        max_tokens=max_tokens,
+                        json_mode=True,
+                        json_schema=prompts.REVIEW_SCHEMA,
                     )
                     truncated = False
                 except LLMTruncatedError as e:

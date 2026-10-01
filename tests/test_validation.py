@@ -99,3 +99,19 @@ def test_check_edit_python_rejects_new_invalid_escape_sequences(capsys):
     result = check_edit("python", Path("m.py"), before, after)
     assert result.ok is False and "invalid escape" in result.message
     assert capsys.readouterr().err == ""  # the warning is captured, not printed
+
+
+def test_normalize_output_removes_run_to_run_noise(tmp_path):
+    from repo_debug_agent.validation import normalize_output
+
+    raw = (
+        f'  File "{tmp_path}/stats.py", line 6, in mean\n'
+        "  /tmp/pytest-of-me/pytest-41/test_wc0/doc.txt\n"
+        "<Item object at 0x7f3a9c0b1d90>\n"
+        "=== 8 failed, 6 passed in 0.31s ==="
+    )
+    clean = normalize_output(raw, tmp_path)
+    assert 'File "stats.py", line 6' in clean
+    assert "<tmp>/test_wc0/doc.txt" in clean and "0x…" in clean
+    assert clean.endswith("=== 8 failed, 6 passed ===")
+    assert count_failures(clean) == 8

@@ -107,9 +107,9 @@ def test_syntax_error_is_rejected_with_feedback(repo, make_settings):
     llm = model(fix_reply("def average(xs):\n    return (sum(xs) / len(xs)"), fix_reply(GOOD_FIX))
     report = run(make_settings(repo), llm=llm, ui=UI.silent())
     [result] = report.results
-    assert [a.outcome for a in result.attempts] == ["rejected_syntax", "applied"]
+    assert [a.outcome for a in result.attempts] == ["rejected_syntax", "suggested"]
     assert "SyntaxError" in fix_calls(llm)[1][3]["content"]
-    assert result.verified_by == "syntax"
+    assert result.status == FixStatus.SUGGESTED and result.verified_by == "syntax"
 
 
 def test_invalid_replies_count_as_attempts(repo, make_settings):
@@ -129,11 +129,55 @@ def test_dismissed_issue_changes_nothing(repo, make_settings):
     assert report.patch_file is None
 
 
-def test_apply_writes_the_fix(repo, make_settings):
+def test_apply_writes_the_verified_fix(repo, make_settings):
     llm = model(fix_reply(GOOD_FIX))
-    report = run(make_settings(repo, apply=True), llm=llm, ui=UI.silent())
+    report = run(make_settings(repo, apply=True, test_cmd=PYTEST_CMD), llm=llm, ui=UI.silent())
+    assert report.results[0].verified_by == "tests"
     assert report.applied_files == ["calc.py"]
     assert "if not xs:" in (repo / "calc.py").read_text()
+
+
+def test_fix_without_evidence_is_a_suggestion_and_never_applied(repo, make_settings):
+    llm = model(fix_reply(GOOD_FIX))
+    report = run(make_settings(repo, apply=True), llm=llm, ui=UI.silent())
+    [result] = report.results
+    assert result.status == FixStatus.SUGGESTED and "+    if not xs:" in result.diff
+    assert report.applied_files == [] and (repo / "calc.py").read_text() == CALC
+    assert report.patch_file is None
+    assert "+    if not xs:" in open(report.suggestions_file).read()
+
+
+def test_keep_unverified_restores_applying_syntax_checked_fixes(repo, make_settings):
+    llm = model(fix_reply(GOOD_FIX))
+    report = run(make_settings(repo, apply=True, keep_unverified=True), llm=llm, ui=UI.silent())
+    assert report.results[0].status == FixStatus.FIXED
+    assert "if not xs:" in (repo / "calc.py").read_text()
+
+
+def test_suggestions_do_not_become_the_base_for_later_fixes(repo, make_settings):
+    # Two issues in one file, no evidence for either: each suggestion is made against the
+    # original code, and nothing lands in the workspace.
+    double_issue = {**AVERAGE_ISSUE, "line": 6, "symbol": "double", "description": "odd"}
+    llm = model(
+        fix_reply(GOOD_FIX),
+        fix_reply("def double(x):\n    return x * 2  # reviewed"),
+        issues=(AVERAGE_ISSUE, double_issue),
+    )
+    report = run(make_settings(repo), llm=llm, ui=UI.silent())
+    assert [r.status for r in report.results] == [FixStatus.SUGGESTED] * 2
+    assert "if not xs" not in fix_calls(llm)[1][1]["content"]
+
+
+def test_static_finding_fixed_counts_as_evidence(tmp_path, make_settings):
+    repo = write_tree(tmp_path / "r", {"m.py": "def area(r):\n    return pi * r * r\n"})
+    llm = model(
+        fix_reply("def area(r):\n    import math\n    return math.pi * r * r"),
+        issues=({"line": 2, "symbol": "area", "confidence": 0.9, "description": "pi undefined"},),
+    )
+    report = run(make_settings(repo), llm=llm, ui=UI.silent())
+    [result] = report.results
+    assert "static" in result.issue.source
+    assert result.status == FixStatus.FIXED and result.verified_by == "static"
 
 
 def test_analyze_only_reports_without_fixing(repo, make_settings):
@@ -158,7 +202,7 @@ def test_two_fixes_in_one_file_both_land(repo, make_settings):
         fix_reply("def double(x):\n    return x * 2  # reviewed"),
         issues=(AVERAGE_ISSUE, double_issue),
     )
-    report = run(make_settings(repo, apply=True), llm=llm, ui=UI.silent())
+    report = run(make_settings(repo, apply=True, keep_unverified=True), llm=llm, ui=UI.silent())
     assert [r.status for r in report.results] == [FixStatus.FIXED, FixStatus.FIXED]
     text = (repo / "calc.py").read_text()
     assert "if not xs:" in text and "# reviewed" in text

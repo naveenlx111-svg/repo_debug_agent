@@ -240,8 +240,25 @@ def run_tests(command: str, cwd: Path, timeout: float) -> TestRun:
         output, _ = proc.communicate()
         code = None
     seconds = time.monotonic() - started
-    failures = 0 if code == 0 else count_failures(output or "")
-    return TestRun(command, code, failures, output or "", seconds)
+    output = normalize_output(output or "", cwd)
+    failures = 0 if code == 0 else count_failures(output)
+    return TestRun(command, code, failures, output, seconds)
+
+
+_DURATION = re.compile(r" in \d+(?:\.\d+)?s\b")
+_PYTEST_TMP = re.compile(r"/tmp/pytest-of-[^/\s]+/pytest-\d+/")
+_ADDRESS = re.compile(r"\b0x[0-9a-fA-F]{6,}\b")
+
+
+def normalize_output(text: str, cwd: Path) -> str:
+    """Drop what changes from run to run (sandbox paths, timings, temp dirs, object
+    addresses). It's noise to the model, and it would make identical failures look new
+    to the review cache."""
+    root = str(cwd)
+    text = text.replace(root + os.sep, "").replace(root, ".")
+    text = _DURATION.sub("", text)
+    text = _PYTEST_TMP.sub("<tmp>/", text)
+    return _ADDRESS.sub("0x…", text)
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:

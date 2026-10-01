@@ -18,9 +18,20 @@ class ScriptedLLM:
         self.respond = respond
         self.usage = Usage()
         self.calls: list[list[Message]] = []
+        self.options: list[dict] = []
 
-    def complete(self, messages, *, model, max_tokens=2048, temperature=None, json_mode=False):
+    def complete(
+        self,
+        messages,
+        *,
+        model,
+        max_tokens=2048,
+        temperature=None,
+        json_mode=False,
+        json_schema=None,
+    ):
         self.calls.append([dict(m) for m in messages])
+        self.options.append({"json_mode": json_mode, "json_schema": json_schema})
         self.usage.calls += 1
         return self.respond(messages, json_mode)
 
@@ -35,6 +46,10 @@ def fix_reply(code: str, explanation: str = "Fixed it.", lang: str = "python") -
 
 def is_repro_request(messages: list[Message]) -> bool:
     return "demonstrates the bug" in messages[1]["content"]
+
+
+def is_vet_request(messages: list[Message]) -> bool:
+    return "checking another engineer's bug reproduction" in messages[0]["content"]
 
 
 def write_tree(root: Path, files: dict[str, str]) -> Path:

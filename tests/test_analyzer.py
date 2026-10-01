@@ -238,3 +238,15 @@ def test_review_token_cap_scales_with_window():
 
     assert review_max_tokens(33) < 1500  # a loop in a small file stops early
     assert review_max_tokens(400) == REVIEW_MAX_TOKENS
+
+
+def test_reviews_request_schema_constrained_output():
+    from repo_debug_agent import prompts
+
+    src = "def g(x):\n    return x\n"
+    sf = SourceFile(path=None, rel="m.py", language=BY_NAME["python"], is_test=False)
+    llm = ScriptedLLM(lambda messages, json_mode: review_reply())
+    Analyzer(llm, "fake", 400).review(sf, src, chunk_source("m.py", src, sf.language))
+    assert llm.options == [{"json_mode": True, "json_schema": prompts.REVIEW_SCHEMA}]
+    required = prompts.REVIEW_SCHEMA["properties"]["issues"]["items"]["required"]
+    assert required.index("trace") < required.index("confirmed")  # reasoning before verdict
