@@ -100,7 +100,7 @@ class LLMSettings:
 
         if timeout is None:
             try:
-                timeout = float(env.get("LLM_TIMEOUT", 300))
+                timeout = float(env.get("LLM_TIMEOUT", "").strip() or 300)  # empty = unset
             except ValueError as e:
                 raise ConfigError(f"LLM_TIMEOUT must be a number of seconds: {e}") from e
 
@@ -151,10 +151,14 @@ class AgentSettings:
     max_issues: int = 20
     min_confidence: float = 0.6
     review_max_lines: int = 400  # files longer than this are reviewed in windows
+    review_passes: int = 2  # follow-up passes look for bugs earlier passes missed
     max_file_bytes: int = 256_000
     workers: int | None = None  # None: the provider's default
 
     # Fixing
+    # Keep fixes with no evidence the bug is real (syntax checks only) in the patch/--apply,
+    # instead of reporting them as suggestions.
+    keep_unverified: bool = False
     repro: bool = True  # reproduce Python bugs with a model-written script before fixing
     python: str | None = None  # interpreter for reproduction scripts (None: auto-detect)
     max_attempts: int = 3
@@ -165,6 +169,7 @@ class AgentSettings:
     embed_model: str = "default"
     index_dir: Path = field(default_factory=default_index_dir)
     reindex: bool = False
+    review_cache: bool = True  # reuse review replies for unchanged review prompts
 
     def __post_init__(self) -> None:
         self.repo = Path(self.repo).expanduser().resolve()
@@ -174,6 +179,8 @@ class AgentSettings:
             raise ConfigError(f"repo path is not a directory: {self.repo}")
         if not 0.0 <= self.min_confidence <= 1.0:
             raise ConfigError("--min-confidence must be between 0 and 1")
+        if self.review_passes < 1:
+            raise ConfigError("--review-passes must be at least 1")
         if self.max_attempts < 1:
             raise ConfigError("--max-attempts must be at least 1")
         if self.workers is None:

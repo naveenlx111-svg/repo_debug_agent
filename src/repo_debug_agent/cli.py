@@ -57,7 +57,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     g = p.add_argument_group("output")
-    g.add_argument("--apply", action="store_true", help="write accepted fixes into the repo")
+    g.add_argument(
+        "--apply",
+        action="store_true",
+        help="write verified fixes into the repo (suggestions are never applied)",
+    )
+    g.add_argument(
+        "--keep-unverified",
+        action="store_true",
+        help="treat fixes that only passed syntax checks as fixes, not suggestions "
+        "(they go into fixes.patch and --apply)",
+    )
     g.add_argument("--analyze-only", action="store_true", help="report issues without fixing")
     g.add_argument(
         "--out",
@@ -82,6 +92,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     g.add_argument("--max-attempts", type=int, default=3, help="fix attempts per issue (default 3)")
     g.add_argument(
+        "--review-passes",
+        type=int,
+        default=2,
+        help="review each file N times; later passes look for bugs earlier ones missed "
+        "(default 2; 1 is faster but finds fewer bugs)",
+    )
+    g.add_argument(
         "--workers",
         type=int,
         help="parallel file reviews (default: 4 for groq, 1 for local servers)",
@@ -100,6 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     g.add_argument("--index-dir", type=Path, help="where the vector index lives")
     g.add_argument("--reindex", action="store_true", help="rebuild the vector index from scratch")
+    g.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="re-review every file instead of reusing cached reviews of unchanged code",
+    )
     return p
 
 
@@ -123,18 +145,21 @@ def settings_from_args(args: argparse.Namespace) -> AgentSettings:
         test_cmd=args.test_cmd,
         test_timeout=args.test_timeout,
         apply=args.apply,
+        keep_unverified=args.keep_unverified,
         analyze_only=args.analyze_only,
         keep_sandbox=args.keep_sandbox,
         include_tests=args.include_tests,
         max_issues=args.max_issues,
         min_confidence=args.min_confidence,
         max_attempts=args.max_attempts,
+        review_passes=args.review_passes,
         repro=not args.no_repro,
         python=args.python,
         workers=args.workers,
         use_embeddings=not args.no_embeddings,
         embed_model=args.embed_model,
         reindex=args.reindex,
+        review_cache=not args.no_cache,
         **extra,
     )
 

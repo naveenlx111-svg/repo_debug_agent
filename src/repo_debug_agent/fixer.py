@@ -23,21 +23,29 @@ from repo_debug_agent.crawler import SourceFile
 from repo_debug_agent.llm import (
     ChatModel,
     LLMError,
+    LLMTruncatedError,
     LLMUnavailableError,
     Message,
     pick_code_block,
     strip_reasoning,
 )
-from repo_debug_agent.models import Attempt, Chunk, FixResult, FixStatus, Issue
+from repo_debug_agent.models import EVIDENCE, Attempt, Chunk, FixResult, FixStatus, Issue
 from repo_debug_agent.repro import Reproducer, ReproStatus, classify
 from repo_debug_agent.retrieval import ContextRetriever
 from repo_debug_agent.retrieval.symbols import SymbolIndex
-from repo_debug_agent.validation import TestRun, TestVerdict, check_edit, judge, run_tests
+from repo_debug_agent.validation import (
+    TestRun,
+    TestVerdict,
+    check_edit,
+    judge,
+    python_findings,
+    run_tests,
+)
 from repo_debug_agent.workspace import Workspace, unified_diff
 
 log = logging.getLogger(__name__)
 
-FIX_MAX_TOKENS = 4096
+FIX_MAX_TOKENS = 4096  # upper bound; see fix_max_tokens
 MAX_REWRITE_LINES = (
     300  # beyond this, asking a model to reproduce the whole unit is too error-prone
 )
@@ -64,12 +72,14 @@ class TestHarness:
         return self.baseline
 
     def evaluate(self) -> tuple[TestVerdict, TestRun]:
+        """Run the suite on the current edits and compare with the baseline."""
         assert self.baseline is not None, "start() first"
         after = self.run()
-        verdict = judge(self.baseline, after)
-        if verdict.acceptable:
-            self.baseline = after
-        return verdict, after
+        return judge(self.baseline, after), after
+
+    def accept(self, run: TestRun) -> None:
+        """The edits `run` tested are staying: they are the new baseline."""
+        self.baseline = run
 
     def output_for(self, rel: str) -> str | None:
         if self.baseline is None or self.baseline.passed:
@@ -195,6 +205,25 @@ def file_excerpt(source: str, chunk: Chunk) -> tuple[str, bool]:
     return "\n".join(head + before[lo:] + [marker] + tail), False
 
 
+def _static_findings_resolved(sf: SourceFile, before: str, after: str) -> bool:
+    """Did the edit remove a serious static-analysis finding (e.g. an undefined name)?"""
+    if sf.language.name != "python":
+        return False
+    return len(python_findings(after, sf.rel)) < len(python_findings(before, sf.rel))
+
+
+def fix_max_tokens(chunk: Chunk) -> int:
+    """Room for a short analysis, the rewritten code (about 3 characters per token, with
+    slack for added lines) and the explanation. Sized to the code, so a model that starts
+    repeating itself is stopped after seconds rather than minutes."""
+    return min(FIX_MAX_TOKENS, 768 + 2 * len(chunk.code) // 3)
+
+
+def _clip(reply: str, limit: int = 600) -> str:
+    """The start of a runaway reply, so the retry sees what went wrong without the loop."""
+    return reply if len(reply) <= limit else reply[:limit] + "\n[... cut off: it kept repeating]"
+
+
 def _with_feedback(base: list[Message], reply: str, feedback: str) -> list[Message]:
     """The original request plus only the latest failed exchange (keeps small contexts small)."""
     return base + [
@@ -215,6 +244,7 @@ class Fixer:
         max_attempts: int = 3,
         base_temperature: float = 0.1,
         reproducer: Reproducer | None = None,
+        keep_unverified: bool = False,
     ):
         self.llm = llm
         self.model = model
@@ -225,6 +255,7 @@ class Fixer:
         self.max_attempts = max_attempts
         self.base_temperature = base_temperature
         self.reproducer = reproducer
+        self.keep_unverified = keep_unverified
 
     def fix(self, issue: Issue, sf: SourceFile) -> FixResult:
         before = self.workspace.read(issue.file)
@@ -254,7 +285,7 @@ class Fixer:
 
         repro = None
         if self.reproducer is not None and sf.language.name == "python":
-            repro = self.reproducer.reproduce(issue, chunk, excerpt)
+            repro = self.reproducer.reproduce(issue, chunk, excerpt, related)
             if repro.status == ReproStatus.NOT_REPRODUCED:
                 return FixResult(
                     issue,
@@ -294,10 +325,20 @@ class Fixer:
             temperature = min(self.base_temperature + 0.2 * (n - 1), 0.7)
             try:
                 reply = self.llm.complete(
-                    messages, model=self.model, max_tokens=FIX_MAX_TOKENS, temperature=temperature
+                    messages,
+                    model=self.model,
+                    max_tokens=fix_max_tokens(chunk),
+                    temperature=temperature,
                 )
             except LLMUnavailableError:
                 raise
+            except LLMTruncatedError as e:
+                # A model that starts repeating itself has often written the code already.
+                if pick_code_block(e.partial) is None:
+                    attempts.append(Attempt(n, "llm_error", "the answer kept repeating itself"))
+                    messages = _with_feedback(base, _clip(e.partial), prompts.feedback_rambling())
+                    continue
+                reply = e.partial
             except LLMError as e:
                 attempts.append(Attempt(n, "llm_error", str(e)))
                 continue
@@ -330,6 +371,9 @@ class Fixer:
             self.workspace.write(issue.file, after)
             verified_by = "syntax" if check.ok else "none"
             detail = "passed syntax/static checks" if check.ok else check.message
+            if "static" in issue.source and _static_findings_resolved(sf, before, after):
+                verified_by, detail = "static", "the static-analysis finding is gone"
+            test_run = None
             if reproduced:
                 run = self.reproducer.run(repro.script, issue.file)
                 if classify(run, issue.file) != "pass":
@@ -342,25 +386,33 @@ class Fixer:
                 verified_by = "repro"
                 detail = "reproduction script now passes"
             if self.tests is not None:
-                verdict, run = self.tests.evaluate()
+                verdict, test_run = self.tests.evaluate()
                 if not verdict.acceptable:
                     self.workspace.write(issue.file, before)
                     attempts.append(Attempt(n, "rejected_tests", verdict.reason))
-                    feedback = prompts.feedback_tests(verdict.reason, run.excerpt())
+                    feedback = prompts.feedback_tests(verdict.reason, test_run.excerpt())
                     messages = _with_feedback(base, reply, feedback)
                     continue
-                if verdict.improved or verified_by != "repro":
-                    verified_by = "tests" if verdict.improved else "no-regressions"
-                detail = f"{detail}; {verdict.reason}" if verified_by == "repro" else verdict.reason
+                if verdict.improved:
+                    verified_by = "tests"
+                elif verified_by not in EVIDENCE:
+                    verified_by = "no-regressions"
+                detail = verdict.reason if verified_by == "tests" else f"{detail}; {verdict.reason}"
 
-            attempts.append(Attempt(n, "applied", detail))
-            self.symbols.replace_file(issue.file, chunk_source(issue.file, after, sf.language))
-            return result(
-                FixStatus.FIXED,
-                parsed.explanation or "(no explanation given)",
-                diff="".join(unified_diff(before, after, issue.file)),
-                verified_by=verified_by,
-            )
+            explanation = parsed.explanation or "(no explanation given)"
+            diff = "".join(unified_diff(before, after, issue.file))
+            if verified_by in EVIDENCE or self.keep_unverified:
+                if test_run is not None:
+                    self.tests.accept(test_run)
+                attempts.append(Attempt(n, "applied", detail))
+                self.symbols.replace_file(issue.file, chunk_source(issue.file, after, sf.language))
+                return result(FixStatus.FIXED, explanation, diff=diff, verified_by=verified_by)
+
+            # Nothing showed the bug is real, so this stays a suggestion: out of the workspace,
+            # the patch and --apply, and later fixes don't build on it.
+            self.workspace.write(issue.file, before)
+            attempts.append(Attempt(n, "suggested", detail))
+            return result(FixStatus.SUGGESTED, explanation, diff=diff, verified_by=verified_by)
 
         last = attempts[-1].detail if attempts else "no attempts made"
         return result(FixStatus.FAILED, f"gave up after {len(attempts)} attempts; last: {last}")

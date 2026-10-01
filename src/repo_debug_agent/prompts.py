@@ -44,6 +44,65 @@ If there are no real bugs, answer {{"issues": []}}.
 """
 
 
+# Decoding constraint matching the shape asked for above, fields in the same order (reasoning
+# before verdict). Supported servers enforce it; others fall back to plain JSON mode. The
+# length limits stop a model that starts repeating itself inside a field: the field is closed
+# and the finding still completes, instead of the reply running into the token limit.
+REVIEW_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "issues": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "line": {"type": "integer"},
+                    "symbol": {"type": "string", "maxLength": 150},
+                    "suspicion": {"type": "string", "maxLength": 300},
+                    "trace": {"type": "string", "maxLength": 700},
+                    "confirmed": {"type": "boolean"},
+                    "severity": {"enum": ["critical", "high", "medium", "low"]},
+                    "confidence": {"type": "number"},
+                    "category": {"type": "string", "maxLength": 40},
+                    "description": {"type": "string", "maxLength": 500},
+                },
+                "required": [
+                    "line",
+                    "symbol",
+                    "suspicion",
+                    "trace",
+                    "confirmed",
+                    "severity",
+                    "confidence",
+                    "category",
+                    "description",
+                ],
+            },
+        }
+    },
+    "required": ["issues"],
+}
+
+
+def review_followup(already_reported: list[str]) -> str:
+    """Extra instructions for a follow-up review pass: look for what the first pass missed."""
+    if already_reported:
+        reported = "A first review of this code already reported:\n" + "\n".join(
+            f"- {r[:220]}" for r in already_reported
+        )
+    else:
+        reported = "A first review of this code reported no bugs."
+    return (
+        f"{reported}\n\n"
+        "Review it again, function by function, for real bugs that review MISSED. Do not repeat "
+        "the findings above. Check especially what first reviews tend to skip: empty strings and "
+        "collections, None, zero and negative numbers, values read from configuration or the "
+        "environment, boundaries and off-by-one errors, and error-handling paths. Most code has no "
+        'further bugs; if you find none, answer {"issues": []}.'
+    )
+
+
 def review_prompt(
     rel: str,
     language: str,
@@ -122,9 +181,11 @@ def fix_prompt(
     if repro:
         script, output = repro
         sections.append(
-            "## Reproduction (verified)\n"
-            "This script was run against the current code and fails, which confirms the bug. "
-            "Your fix must make it pass.\n"
+            "## Reproduction attempt\n"
+            "The reviewer wrote this script and it fails against the current code. First check "
+            "that its inputs are ones the real callers can produce and that its assertion matches "
+            "how the code is meant to behave. If not, the report is still wrong: answer NOT_A_BUG. "
+            "If it is a real bug, your fix must make this script pass.\n"
             f"```{fence}\n{script.rstrip()}\n```\nOutput:\n```\n{output}\n```"
         )
     import_note = (
@@ -140,8 +201,8 @@ def fix_prompt(
         f"```{fence}\n<the complete corrected replacement for {target}: {whole}not a diff, "
         "not only the changed lines, and nothing else>\n```\n"
         "EXPLANATION: <one sentence: what was wrong and how you fixed it>\n\n"
-        "Code outside the block you return cannot be changed, so don't rely on edits elsewhere."
-        + import_note
+        "Keep the ANALYSIS short and put no commentary inside the code. Code outside the block "
+        "you return cannot be changed, so don't rely on edits elsewhere." + import_note
     )
     return "\n\n".join(sections)
 
@@ -184,23 +245,34 @@ REPRO_SYSTEM = (
 )
 
 
-def repro_prompt(issue: Issue, chunk: Chunk, file_excerpt: str, imports: str) -> str:
+def repro_prompt(
+    issue: Issue, chunk: Chunk, file_excerpt: str, imports: str, related: str = ""
+) -> str:
     line = f" (line {issue.line})" if issue.line else ""
+    usage = f"## How this code is used elsewhere\n{related}\n\n" if related else ""
     return (
         f"An automated reviewer suspects a bug in `{chunk.file}`{line}. Automated reviewers are "
         "often wrong.\n"
         f"- Report: {issue.description}\n\n"
         f"## The code in question: {describe_target(chunk)}\n```python\n{chunk.code}\n```\n\n"
         f"## Rest of the file, for reference\n```python\n{file_excerpt}\n```\n\n"
+        f"{usage}"
         "## Task\n"
         "Write a short standalone Python script that demonstrates the bug by running the real code.\n"
         f"- Import the code with: `{imports}` (it runs from the repository root, which is on sys.path).\n"
-        "- Call it with the input that triggers the bug, and `assert` what correct code must do.\n"
+        "- Use only inputs the code can really receive: values its real callers could pass. "
+        "Calling it with arguments that break how the rest of the code uses it (wrong types, "
+        "impossible shapes, internal objects built by hand to be invalid) does not show a bug.\n"
+        "- Do not use mocks, fakes or monkeypatching: they make anything fail.\n"
+        "- `assert` the behaviour the code is clearly meant to have (from its name, docstring, "
+        "callers and tests), not what you would prefer.\n"
         "- While the bug exists the script must fail (AssertionError or the reported exception); "
         "once the bug is fixed it must pass.\n"
-        "- No test framework, no network, no files outside a temporary directory, under 30 lines.\n\n"
-        "If the problem can't be shown by running code (a leak, a race) or you conclude the code "
-        "is actually correct, reply with one line: NOT_REPRODUCIBLE: <reason>\n"
+        "- No test framework, no network, no files outside a temporary directory, under 30 lines, "
+        "and no reasoning written into comments.\n\n"
+        "If the problem can't be shown this way (a leak, a race, or only with impossible inputs) "
+        "or you conclude the code is actually correct, reply with one line: "
+        "NOT_REPRODUCIBLE: <reason>\n"
         "Otherwise reply with only the script, in one ```python code block."
     )
 
@@ -217,4 +289,64 @@ def repro_feedback_broken(output: str) -> str:
     return (
         "Your script failed for an unrelated reason, before reaching the code in question:\n"
         f"```\n{output}\n```\nFix the script and reply with it again, in one ```python block."
+    )
+
+
+def repro_feedback_mocks() -> str:
+    return (
+        "Your script uses mocks or monkeypatching. A mock can make any code fail, so it "
+        "demonstrates the mock, not a bug. Rewrite it to run the real code with inputs its real "
+        "callers could pass, or reply NOT_REPRODUCIBLE: <reason> if that can't show the bug."
+    )
+
+
+def repro_feedback_rejected(why: str) -> str:
+    return (
+        "A check of your script found a problem with it:\n"
+        f"{why}\n"
+        "Rewrite it with inputs the real program can produce and an assertion that matches how "
+        "the code is meant to behave, or reply NOT_REPRODUCIBLE: <reason> if the bug can't be "
+        "shown that way."
+    )
+
+
+# --------------------------------------------------------------------------- reproduction check
+
+VET_SYSTEM = (
+    "You are a skeptical senior engineer checking another engineer's bug reproduction. Scripts "
+    "often manufacture failures by passing inputs the real program never produces, or by "
+    "asserting what the author wanted instead of what the code is meant to do."
+)
+
+
+def vet_prompt(issue: Issue, chunk: Chunk, script: str, output: str, related: str) -> str:
+    usage = related or "(no other code in the repository calls it)"
+    return (
+        f"Bug report for `{chunk.file}`: {issue.description}\n\n"
+        f"## The code\n```python\n{chunk.code}\n```\n\n"
+        f"## How the rest of the repository uses it\n{usage}\n\n"
+        f"## The reproduction script\n```python\n{script.rstrip()}\n```\n"
+        f"It fails against the current code:\n```\n{output}\n```\n\n"
+        "Answer in exactly this format:\n"
+        "INPUT: realistic or unrealistic - could the real program pass these inputs, the way the "
+        "callers above do or its documented interface allows? One sentence.\n"
+        "EXPECTATION: correct or wrong - does the script assert what the code is meant to do "
+        "(its name, docstring, callers, tests), not a preference? One sentence.\n"
+        "VERDICT: VALID if the input is realistic and the expectation correct, otherwise INVALID"
+    )
+
+
+def feedback_rambling() -> str:
+    return (
+        "Your answer got stuck repeating itself and was cut off before it was complete. Start "
+        "again in the required structure: at most 4 sentences of ANALYSIS, the VERDICT, then the "
+        "code with no commentary inside it."
+    )
+
+
+def feedback_rambling_script() -> str:
+    return (
+        "Your answer got stuck repeating itself and was cut off. Reply with only the script, in "
+        "one ```python block, under 30 lines, with no reasoning in comments. Or NOT_REPRODUCIBLE: "
+        "<reason>."
     )

@@ -16,10 +16,14 @@ STATUS_ICON = {
     FixStatus.FAILED: "❌",
     FixStatus.SKIPPED: "⏭️",
     FixStatus.REPORTED: "🔎",
+    FixStatus.SUGGESTED: "💡",
 }
+WROTE_A_FIX = (FixStatus.FIXED, FixStatus.SUGGESTED)
 VERIFIED_LABEL = {
     "tests": "test suite (improved)",
-    "repro": "reproduction script (failed before the fix, passes after)",
+    "repro": "a model-written reproduction script (failed before, passes after); "
+    "check that its assertion is the intended behaviour",
+    "static": "static analysis (the finding it fixes is gone)",
     "no-regressions": "test suite (no regressions; no test covered the bug)",
     "syntax": "syntax + static checks only",
     "none": "not verified (no checker for this language)",
@@ -46,6 +50,7 @@ class RunReport:
     applied_files: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     patch_file: str | None = None
+    suggestions_file: str | None = None
 
     def counts(self) -> Counter[str]:
         return Counter(r.status.value for r in self.results)
@@ -82,7 +87,11 @@ def render_markdown(report: RunReport) -> str:
             f"before: {report.baseline_tests.summary()}; after: {final}"
         )
     if report.patch_file:
-        lines.append(f"- **Patch:** `{report.patch_file}`")
+        lines.append(f"- **Patch** (verified fixes): `{report.patch_file}`")
+    if report.suggestions_file:
+        lines.append(
+            f"- **Suggestions** (unverified, review before applying): `{report.suggestions_file}`"
+        )
     if report.applied_files:
         lines.append(f"- **Applied to:** {', '.join(f'`{f}`' for f in report.applied_files)}")
     lines += ["", "| Result | Count |", "| --- | ---: |"]
@@ -111,12 +120,19 @@ def render_markdown(report: RunReport) -> str:
             f"**Report:** {issue.description}",
         ]
         if result.explanation:
-            label = "Fix" if result.status == FixStatus.FIXED else "Outcome"
+            label = "Fix" if result.status in WROTE_A_FIX else "Outcome"
             lines += ["", f"**{label}:** {result.explanation}"]
         if result.status == FixStatus.FIXED:
             lines += [
                 "",
                 f"**Verified by:** {VERIFIED_LABEL.get(result.verified_by, result.verified_by)}",
+            ]
+        elif result.status == FixStatus.SUGGESTED:
+            lines += [
+                "",
+                "**Not applied:** nothing showed this bug is real (checked only by: "
+                f"{VERIFIED_LABEL.get(result.verified_by, result.verified_by)}). "
+                "Review the diff before using it.",
             ]
         if result.repro_status:
             lines += ["", f"**Reproduction:** {result.repro_status.replace('_', ' ')}"]
@@ -143,7 +159,11 @@ def render_markdown(report: RunReport) -> str:
 
 
 def write_outputs(
-    report: RunReport, patch: str, out_dir: Path, transcript: list[dict] | None = None
+    report: RunReport,
+    patch: str,
+    out_dir: Path,
+    transcript: list[dict] | None = None,
+    suggestions: str = "",
 ) -> dict[str, Path]:
     import json
 
@@ -158,6 +178,10 @@ def write_outputs(
         paths["patch"] = out_dir / "fixes.patch"
         paths["patch"].write_text(patch, encoding="utf-8")
         report.patch_file = str(paths["patch"])
+    if suggestions:
+        paths["suggestions"] = out_dir / "suggestions.patch"
+        paths["suggestions"].write_text(suggestions, encoding="utf-8")
+        report.suggestions_file = str(paths["suggestions"])
     paths["json"].write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
     paths["markdown"].write_text(render_markdown(report), encoding="utf-8")
     return paths

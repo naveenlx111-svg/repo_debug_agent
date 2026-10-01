@@ -26,7 +26,11 @@ class LLMError(RuntimeError):
 
 
 class LLMTruncatedError(LLMError):
-    """The reply hit max_tokens before finishing."""
+    """The reply hit max_tokens before finishing. `partial` is what was generated."""
+
+    def __init__(self, message: str, partial: str = ""):
+        super().__init__(message)
+        self.partial = partial
 
 
 class LLMUnavailableError(LLMError):
@@ -51,6 +55,7 @@ class ChatModel(Protocol):
         max_tokens: int = 2048,
         temperature: float | None = None,
         json_mode: bool = False,
+        json_schema: dict[str, Any] | None = None,
     ) -> str: ...
 
 
@@ -63,6 +68,7 @@ class OpenAICompatibleLLM:
         self.usage = Usage()
         self._lock = threading.Lock()
         self._json_mode_supported = True
+        self._schema_supported = True
         self._client = openai.OpenAI(
             base_url=settings.base_url,
             api_key=settings.api_key or "not-needed",
@@ -86,7 +92,10 @@ class OpenAICompatibleLLM:
         max_tokens: int = 2048,
         temperature: float | None = None,
         json_mode: bool = False,
+        json_schema: dict[str, Any] | None = None,
     ) -> str:
+        """`json_schema` constrains decoding to that exact shape where the server supports
+        it (llama.cpp does), falling back to plain JSON mode, then to prompt-only JSON."""
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -95,18 +104,38 @@ class OpenAICompatibleLLM:
         }
         if self.settings.extra_body:
             kwargs["extra_body"] = self.settings.extra_body
-        use_json = json_mode and self._json_mode_supported
-        if use_json:
-            kwargs["response_format"] = {"type": "json_object"}
+        response_format: dict[str, Any] | None = None
+        if json_schema is not None and self._schema_supported:
+            # A schema keeps the output well-formed even when a small model writes an
+            # unescaped quote inside a string: the grammar forces the next key instead of
+            # letting the reply derail.
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {"name": "reply", "schema": json_schema},
+            }
+        elif (json_mode or json_schema is not None) and self._json_mode_supported:
+            response_format = {"type": "json_object"}
+        if response_format:
+            kwargs["response_format"] = response_format
 
         try:
             response = self._client.chat.completions.create(**kwargs)
         except self._openai.BadRequestError as e:
-            if use_json and ("response_format" in str(e) or "json" in str(e).lower()):
-                log.warning("endpoint rejected JSON mode; falling back to prompt-only JSON (%s)", e)
-                self._json_mode_supported = False
+            text = str(e).lower()
+            if response_format and any(w in text for w in ("response_format", "json", "schema")):
+                if response_format["type"] == "json_schema":
+                    log.warning("endpoint rejected JSON-schema output; using JSON mode (%s)", e)
+                    self._schema_supported = False
+                else:
+                    log.warning("endpoint rejected JSON mode; using prompt-only JSON (%s)", e)
+                    self._json_mode_supported = False
                 return self.complete(
-                    messages, model=model, max_tokens=max_tokens, temperature=temperature
+                    messages,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    json_mode=json_mode,
+                    json_schema=json_schema,
                 )
             raise LLMError(f"request rejected: {e}") from e
         except self._openai.APITimeoutError as e:
@@ -126,7 +155,10 @@ class OpenAICompatibleLLM:
 
         choice = response.choices[0]
         if choice.finish_reason == "length":
-            raise LLMTruncatedError(f"reply was cut off at max_tokens={max_tokens}")
+            raise LLMTruncatedError(
+                f"reply was cut off at max_tokens={max_tokens}",
+                partial=strip_reasoning(choice.message.content or ""),
+            )
         text = strip_reasoning(choice.message.content or "")
         if not text:
             raise LLMError(
@@ -157,6 +189,7 @@ class RecordingLLM:
             return reply
         except LLMError as e:
             error = str(e)
+            reply = getattr(e, "partial", None) or None  # keep what a cut-off reply said
             raise
         finally:
             record = {
@@ -218,6 +251,28 @@ def parse_json(text: str) -> Any:
         if isinstance(value, (dict, list)):
             return value
     raise ValueError("no JSON value found in model reply")
+
+
+def salvage_array_items(text: str, field: str) -> list[dict]:
+    """Complete objects from the `field` array of a JSON reply that broke off part-way
+    (token limit, or a model that started looping after its useful answers)."""
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*\[', text)
+    if match is None:
+        return []
+    decoder = json.JSONDecoder()
+    items: list[dict] = []
+    i = match.end()
+    while True:
+        while i < len(text) and text[i] in " \t\r\n,":
+            i += 1
+        if i >= len(text) or text[i] != "{":
+            return items
+        try:
+            value, i = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            return items
+        if isinstance(value, dict):
+            items.append(value)
 
 
 def extract_code_blocks(text: str) -> list[tuple[str, str]]:

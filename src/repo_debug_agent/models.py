@@ -72,6 +72,13 @@ class FixStatus(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     REPORTED = "reported"  # --analyze-only: found, not attempted
+    SUGGESTED = "suggested"  # a fix was written, but nothing showed the bug is real: not applied
+
+
+# Verification that shows the bug was real and the fix addressed it. Fixes without one of
+# these are only suggestions: passing a syntax check says nothing about whether the edit
+# was needed.
+EVIDENCE = frozenset({"tests", "repro", "static"})
 
 
 @dataclass
@@ -88,7 +95,8 @@ class FixResult:
     status: FixStatus
     explanation: str = ""
     diff: str = ""
-    # How the accepted change was verified: "tests" | "repro" | "no-regressions" | "syntax" | "none"
+    # How the change was verified; EVIDENCE members show the bug was real.
+    # "tests" | "repro" | "static" | "no-regressions" | "syntax" | "none"
     verified_by: str = "none"
     attempts: list[Attempt] = field(default_factory=list)
     # "reproduced" | "not_reproduced" | "unavailable" | "" (not attempted), and the script used

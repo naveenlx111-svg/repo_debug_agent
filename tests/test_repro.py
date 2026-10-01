@@ -3,7 +3,14 @@
 import sys
 
 import pytest
-from conftest import ScriptedLLM, fix_reply, is_repro_request, review_reply, write_tree
+from conftest import (
+    ScriptedLLM,
+    fix_reply,
+    is_repro_request,
+    is_vet_request,
+    review_reply,
+    write_tree,
+)
 
 from repo_debug_agent.models import Chunk, FixStatus
 from repo_debug_agent.pipeline import run
@@ -81,13 +88,23 @@ def repo(tmp_path):
     return write_tree(tmp_path / "repo", {"calc.py": CALC})
 
 
-def scripted(issues, repros, fixes):
-    """Review -> `issues`; repro requests -> `repros` in order; fix requests -> `fixes` in order."""
+VALID = "INPUT: realistic\nEXPECTATION: correct\nVERDICT: VALID"
+INVALID = (
+    "INPUT: unrealistic - no caller passes an empty tuple.\nEXPECTATION: correct\nVERDICT: INVALID"
+)
+
+
+def scripted(issues, repros, fixes, vets=None):
+    """Review -> `issues`; repro requests -> `repros`; script checks -> `vets` (default: all
+    VALID); fix requests -> `fixes`. Each list is consumed in order."""
     repros, fixes = iter(repros), iter(fixes)
+    vets = iter(vets) if vets is not None else None
 
     def respond(messages, json_mode):
         if json_mode:
             return review_reply(*issues)
+        if is_vet_request(messages):
+            return next(vets) if vets is not None else VALID
         if is_repro_request(messages):
             return next(repros)
         return next(fixes)
@@ -110,9 +127,12 @@ def test_reproduced_bug_is_fixed_and_verified_by_the_script(repo, make_settings)
     assert result.status == FixStatus.FIXED
     assert result.verified_by == "repro" and result.repro_status == "reproduced"
     fix_prompt = next(
-        c for c in llm.calls if "Report:" in c[1]["content"] and not is_repro_request(c)
+        c
+        for c in llm.calls
+        if "Report:" in c[1]["content"] and not is_repro_request(c) and not is_vet_request(c)
     )[1]["content"]
-    assert "## Reproduction (verified)" in fix_prompt and "ZeroDivisionError" in fix_prompt
+    assert "## Reproduction attempt" in fix_prompt and "ZeroDivisionError" in fix_prompt
+    assert "real callers" in fix_prompt  # the fixer is asked to vet the script, not trust it
 
 
 def test_unreproducible_report_is_dismissed_without_a_fix_attempt(repo, make_settings):
@@ -159,12 +179,46 @@ def test_fix_that_leaves_the_script_failing_is_rejected(repo, make_settings):
         ["NOT_REPRODUCIBLE: this is a resource leak"],  # can't be scripted
     ],
 )
-def test_without_a_usable_script_fixing_proceeds_as_before(repo, make_settings, repros):
+def test_without_a_usable_script_the_fix_is_only_a_suggestion(repo, make_settings, repros):
     llm = scripted([AVERAGE], repros, [fix_reply(GOOD_FIX)])
     report = run(settings(make_settings, repo), llm=llm, ui=UI.silent())
     [result] = report.results
-    assert result.status == FixStatus.FIXED
+    assert result.status == FixStatus.SUGGESTED
     assert result.repro_status == "unavailable" and result.verified_by == "syntax"
+
+
+def test_a_script_the_check_rejects_is_retried_with_the_reason(repo, make_settings):
+    llm = scripted(
+        [AVERAGE],
+        [
+            script("from calc import average\naverage(None)"),
+            script("from calc import average\nassert average([]) == 0"),
+        ],
+        [fix_reply(GOOD_FIX)],
+        vets=[INVALID, VALID],
+    )
+    report = run(settings(make_settings, repo), llm=llm, ui=UI.silent())
+    [result] = report.results
+    assert result.repro_status == "reproduced" and result.verified_by == "repro"
+    retry = next(c for c in llm.calls if is_repro_request(c) and len(c) == 4)
+    assert "no caller passes an empty tuple" in retry[3]["content"]
+
+
+def test_a_script_rejected_twice_is_not_evidence(repo, make_settings):
+    manufactured = script("from calc import average\naverage(None)")
+    llm = scripted(
+        [AVERAGE], [manufactured, manufactured], [fix_reply(GOOD_FIX)], vets=[INVALID, INVALID]
+    )
+    report = run(settings(make_settings, repo), llm=llm, ui=UI.silent())
+    [result] = report.results
+    assert result.repro_status == "rejected"  # not dismissed: the check can be wrong too
+    assert result.status == FixStatus.SUGGESTED and result.verified_by == "syntax"
+    fix_prompt = next(
+        c
+        for c in llm.calls
+        if "Report:" in c[1]["content"] and not is_repro_request(c) and not is_vet_request(c)
+    )
+    assert "## Reproduction attempt" not in fix_prompt[1]["content"]
 
 
 def test_a_misbehaving_script_cannot_corrupt_the_repo_or_the_sandbox(repo, make_settings):
@@ -177,3 +231,62 @@ def test_a_misbehaving_script_cannot_corrupt_the_repo_or_the_sandbox(repo, make_
     assert [a.outcome for a in result.attempts] == ["rejected_repro"] * 3
     assert "oops" not in result.attempts[0].detail
     assert (repo / "calc.py").read_text() == CALC
+
+
+def test_uses_mocks():
+    from repo_debug_agent.repro import uses_mocks
+
+    assert uses_mocks("from unittest.mock import MagicMock")
+    assert uses_mocks("from unittest import mock\nmock.patch('x')")
+    assert uses_mocks("import mock")
+    assert not uses_mocks("from calc import average\nassert average([1]) == 1")
+    assert not uses_mocks("mockingbird = 1")
+
+
+def test_mock_based_scripts_are_never_accepted_as_reproductions(repo, make_settings):
+    mocked = script(
+        "from unittest.mock import MagicMock\nimport calc\n"
+        "calc.average = MagicMock(side_effect=ZeroDivisionError)\ncalc.average([1])"
+    )
+    llm = scripted([AVERAGE], [mocked, mocked], [fix_reply(GOOD_FIX)])
+    report = run(settings(make_settings, repo), llm=llm, ui=UI.silent())
+    [result] = report.results
+    assert result.repro_status == "unavailable" and result.verified_by == "syntax"
+    feedback = next(c for c in llm.calls if len(c) == 4 and is_repro_request(c))[3]["content"]
+    assert "mocks" in feedback
+
+
+def test_runaway_repro_reply_with_complete_script_is_used(repo, make_settings):
+    from repo_debug_agent.llm import LLMTruncatedError
+
+    partial = script("from calc import average\nassert average([]) == 0") + "\nWait, maybe" * 50
+
+    def respond(messages, json_mode):
+        if json_mode:
+            return review_reply(AVERAGE)
+        if is_vet_request(messages):
+            return VALID
+        if is_repro_request(messages):
+            raise LLMTruncatedError("cut off", partial=partial)
+        return fix_reply(GOOD_FIX)
+
+    report = run(settings(make_settings, repo), llm=ScriptedLLM(respond), ui=UI.silent())
+    assert report.results[0].repro_status == "reproduced"
+
+
+def test_repro_reply_that_never_produces_a_script_is_unavailable(repo, make_settings):
+    from repo_debug_agent.llm import LLMTruncatedError
+
+    seen = []
+
+    def respond(messages, json_mode):
+        if json_mode:
+            return review_reply(AVERAGE)
+        if is_repro_request(messages):
+            seen.append(messages)
+            raise LLMTruncatedError("cut off", partial="# Wait, maybe... " * 300)
+        return fix_reply(GOOD_FIX)
+
+    report = run(settings(make_settings, repo), llm=ScriptedLLM(respond), ui=UI.silent())
+    assert report.results[0].repro_status == "unavailable"
+    assert len(seen) == 2 and "stuck repeating itself" in seen[1][3]["content"]

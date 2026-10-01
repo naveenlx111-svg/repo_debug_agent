@@ -195,3 +195,86 @@ def test_truncated_review_is_split_and_retried():
     covered = sorted(w for w in windows[1:] if w[1] - w[0] <= 60)
     assert covered[0][0] == 1 and covered[-1][1] == 89
     assert len(review.issues) == len(covered)
+
+
+def test_truncated_review_keeps_complete_findings_instead_of_losing_the_file():
+    from repo_debug_agent.llm import LLMTruncatedError
+
+    src = "def f(x):\n    return x[0]\n\n\ndef g(x):\n    return x[1]\n"
+    sf = SourceFile(path=None, rel="m.py", language=BY_NAME["python"], is_test=False)
+    partial = (
+        '{"issues": [{"line": 2, "symbol": "f", "confirmed": true, "confidence": 0.9, '
+        '"description": "IndexError on []"}, {"line": 5, "trace": "Wait... No. Wait'
+    )
+    calls = []
+
+    def respond(messages, json_mode):
+        calls.append(1)
+        raise LLMTruncatedError("cut off", partial=partial)
+
+    review = Analyzer(ScriptedLLM(respond), "fake", 400).review(
+        sf, src, chunk_source("m.py", src, sf.language)
+    )
+    assert [i.symbol for i in review.issues] == ["f"]
+    assert "kept its 1 complete finding" in review.error
+    assert len(calls) == 1  # salvaged, so no split-and-retry
+
+
+def test_finished_reply_with_broken_json_keeps_every_complete_finding():
+    src = "def f(x):\n    return x[0]\n\n\ndef g(x):\n    return x[1]\n"
+    sf = SourceFile(path=None, rel="m.py", language=BY_NAME["python"], is_test=False)
+    broken = (
+        '{"issues": [{"line": 2, "description": "IndexError in f"}, '
+        '{"line": 6, "description": "IndexError in g"}, {"line": ": ", "trace": "}'
+    )
+    review = Analyzer(ScriptedLLM(lambda m, j: broken), "fake", 400).review(
+        sf, src, chunk_source("m.py", src, sf.language)
+    )
+    assert sorted(i.symbol for i in review.issues) == ["f", "g"]
+
+
+def test_review_token_cap_scales_with_window():
+    from repo_debug_agent.analyzer import REVIEW_MAX_TOKENS, review_max_tokens
+
+    assert review_max_tokens(33) < 1500  # a loop in a small file stops early
+    assert review_max_tokens(400) == REVIEW_MAX_TOKENS
+
+
+def test_reviews_request_schema_constrained_output():
+    from repo_debug_agent import prompts
+
+    src = "def g(x):\n    return x\n"
+    sf = SourceFile(path=None, rel="m.py", language=BY_NAME["python"], is_test=False)
+    llm = ScriptedLLM(lambda messages, json_mode: review_reply())
+    Analyzer(llm, "fake", 400).review(sf, src, chunk_source("m.py", src, sf.language))
+    assert llm.options == [{"json_mode": True, "json_schema": prompts.REVIEW_SCHEMA}]
+    required = prompts.REVIEW_SCHEMA["properties"]["issues"]["items"]["required"]
+    assert required.index("trace") < required.index("confirmed")  # reasoning before verdict
+
+
+def test_review_schema_bounds_runaway_fields():
+    from repo_debug_agent import prompts
+
+    issues = prompts.REVIEW_SCHEMA["properties"]["issues"]
+    fields = issues["items"]["properties"]
+    assert issues["maxItems"] <= 10
+    assert all("maxLength" in fields[f] for f in ("suspicion", "trace", "description"))
+
+
+def test_second_pass_looks_for_what_the_first_missed():
+    src = "def f(x):\n    return x[0]\n\n\ndef g(x):\n    return 1 / x\n"
+    sf = SourceFile(path=None, rel="m.py", language=BY_NAME["python"], is_test=False)
+    first = {"line": 2, "symbol": "f", "confidence": 0.9, "description": "IndexError on []"}
+    second = {"line": 6, "symbol": "g", "confidence": 0.9, "description": "ZeroDivisionError on 0"}
+
+    def respond(messages, json_mode):
+        followup = "A first review of this code already reported" in messages[1]["content"]
+        return review_reply(second if followup else first)
+
+    llm = ScriptedLLM(respond)
+    review = Analyzer(llm, "fake", 400, passes=2).review(
+        sf, src, chunk_source("m.py", src, sf.language)
+    )
+    assert len(llm.calls) == 2
+    assert "line 2 (f): IndexError on []" in llm.calls[1][1]["content"]
+    assert [(i.symbol, i.source) for i in review.issues] == [("f", "llm"), ("g", "llm-pass2")]
